@@ -913,26 +913,308 @@ static void discardHttpHeaders(NetworkClient &client)
   }
 }
 
+static void sanitizeJsonText(const char *src, char *dst, size_t dst_len)
+{
+  if (!dst || dst_len == 0) {
+    return;
+  }
+
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+
+  size_t out = 0;
+  for (size_t i = 0; src[i] != '\0' && out < (dst_len - 1); ++i) {
+    char c = src[i];
+    if (c == '"' || c == '\\') {
+      c = '\'';
+    } else if (c == '\r' || c == '\n' || c == '\t') {
+      c = ' ';
+    }
+    dst[out++] = c;
+  }
+
+  dst[out] = '\0';
+}
+
+static const char *screenIdSlug(AppScreenId screen_id)
+{
+  switch (screen_id) {
+    case SCREEN_EFIS:
+      return "plane";
+    case SCREEN_METEO:
+      return "meteo";
+    case SCREEN_GPS:
+      return "comms";
+    case SCREEN_CONFIG:
+      return "config";
+    default:
+      return "home";
+  }
+}
+
+static const char *screenIdLabel(AppScreenId screen_id)
+{
+  switch (screen_id) {
+    case SCREEN_EFIS:
+      return "PLANE";
+    case SCREEN_METEO:
+      return "METEO";
+    case SCREEN_GPS:
+      return "COMMS";
+    case SCREEN_CONFIG:
+      return "CONFIG";
+    default:
+      return "HOME";
+  }
+}
+
+static bool parseHttpPath(const char *request_line, char *path_out, size_t path_out_len)
+{
+  if (!request_line || !path_out || path_out_len == 0) {
+    return false;
+  }
+
+  const char *start = strstr(request_line, "GET ");
+  if (!start) {
+    return false;
+  }
+  start += 4;
+
+  const char *end = strstr(start, " HTTP/");
+  if (!end || end <= start) {
+    return false;
+  }
+
+  size_t len = static_cast<size_t>(end - start);
+  if (len >= path_out_len) {
+    len = path_out_len - 1;
+  }
+
+  memcpy(path_out, start, len);
+  path_out[len] = '\0';
+  return true;
+}
+
+static bool httpQueryValue(const char *path, const char *key, char *value_out, size_t value_out_len)
+{
+  if (!path || !key || !value_out || value_out_len == 0) {
+    return false;
+  }
+
+  const char *query = strchr(path, '?');
+  if (!query) {
+    return false;
+  }
+  ++query;
+
+  const size_t key_len = strlen(key);
+  while (*query) {
+    const char *segment_end = strchr(query, '&');
+    if (!segment_end) {
+      segment_end = path + strlen(path);
+    }
+
+    const char *eq = static_cast<const char *>(memchr(query, '=', segment_end - query));
+    if (eq && static_cast<size_t>(eq - query) == key_len && strncmp(query, key, key_len) == 0) {
+      size_t value_len = static_cast<size_t>(segment_end - eq - 1);
+      if (value_len >= value_out_len) {
+        value_len = value_out_len - 1;
+      }
+      memcpy(value_out, eq + 1, value_len);
+      value_out[value_len] = '\0';
+      return true;
+    }
+
+    if (*segment_end == '\0') {
+      break;
+    }
+    query = segment_end + 1;
+  }
+
+  return false;
+}
+
+static bool parseScreenIdFromSlug(const char *slug, AppScreenId *screen_out)
+{
+  if (!slug || !screen_out) {
+    return false;
+  }
+
+  if (strcmp(slug, "home") == 0) {
+    *screen_out = SCREEN_HOME;
+    return true;
+  }
+  if (strcmp(slug, "plane") == 0) {
+    *screen_out = SCREEN_EFIS;
+    return true;
+  }
+  if (strcmp(slug, "meteo") == 0) {
+    *screen_out = SCREEN_METEO;
+    return true;
+  }
+  if (strcmp(slug, "comms") == 0) {
+    *screen_out = SCREEN_GPS;
+    return true;
+  }
+  if (strcmp(slug, "config") == 0) {
+    *screen_out = SCREEN_CONFIG;
+    return true;
+  }
+
+  return false;
+}
+
+static void requestWifiMode(bool enable, const char *origin)
+{
+  g_wifi_mode_requested = enable;
+  if (enable) {
+    g_sd_purge_armed = false;
+  }
+
+  Serial.printf("[WIFI] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
+  updateRuntimeServiceMode();
+}
+
+static void requestLoraMode(bool enable, const char *origin)
+{
+  g_lora_enabled = enable;
+  Serial.printf("[LORA] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
+}
+
+static void requestCommsRescan(const char *origin)
+{
+  g_blackbox_remount_requested = true;
+  refreshSensorCaches();
+  Serial.printf("[COMMS] Rescan solicitado via %s\n", origin ? origin : "sistema");
+  printWifiStatus("Rescan");
+}
+
+static void requestLoggerToggle(const char *origin)
+{
+  g_blackbox_enabled_target = !g_blackbox_enabled_target;
+  Serial.printf("[BLACKBOX] Toggle via %s: %s\n", origin ? origin : "sistema", g_blackbox_enabled_target ? "ON" : "OFF");
+}
+
+static void requestEfisLevelSet(const char *origin)
+{
+  const ImuState imu = copyImuState();
+  float pitch_trim_deg = 0.0f;
+  float roll_trim_deg = 0.0f;
+  getImuTrim(&pitch_trim_deg, &roll_trim_deg);
+  setImuTrim(pitch_trim_deg + imu.pitch_deg, roll_trim_deg + imu.roll_deg);
+  Serial.printf("[EFIS] Nivel ajustado via %s\n", origin ? origin : "sistema");
+}
+
+static void requestScreenLoad(AppScreenId screen_id, const char *origin)
+{
+  if (g_runtime_services_light && screen_id == SCREEN_METEO) {
+    Serial.printf("[MODE] %s pediu METEO completo; desligando Wi-Fi antes de trocar.\n", origin ? origin : "sistema");
+    g_wifi_mode_requested = false;
+    stopWifiPortal();
+  }
+
+  if (g_current_screen_id != screen_id) {
+    loadScreenById(screen_id);
+    Serial.printf("[UI] Tela alterada via %s para %s\n", origin ? origin : "sistema", screenIdLabel(screen_id));
+  }
+}
+
+static void handleHttpActionPath(const char *path)
+{
+  if (!path) {
+    return;
+  }
+
+  char value[24];
+
+  if (httpQueryValue(path, "screen", value, sizeof(value))) {
+    AppScreenId screen_id = SCREEN_HOME;
+    if (parseScreenIdFromSlug(value, &screen_id)) {
+      requestScreenLoad(screen_id, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "wifi", value, sizeof(value))) {
+    if (strcmp(value, "on") == 0) {
+      requestWifiMode(true, "web");
+    } else if (strcmp(value, "off") == 0) {
+      requestWifiMode(false, "web");
+    } else if (strcmp(value, "toggle") == 0) {
+      requestWifiMode(!g_wifi_mode_requested, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "lora", value, sizeof(value))) {
+    if (strcmp(value, "on") == 0) {
+      requestLoraMode(true, "web");
+    } else if (strcmp(value, "off") == 0) {
+      requestLoraMode(false, "web");
+    } else if (strcmp(value, "toggle") == 0) {
+      requestLoraMode(!g_lora_enabled, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "logger", value, sizeof(value))) {
+    if (strcmp(value, "toggle") == 0) {
+      requestLoggerToggle("web");
+    }
+  }
+
+  if (httpQueryValue(path, "rescan", value, sizeof(value))) {
+    if (strcmp(value, "1") == 0) {
+      requestCommsRescan("web");
+    }
+  }
+
+  if (httpQueryValue(path, "level", value, sizeof(value))) {
+    if (strcmp(value, "1") == 0) {
+      requestEfisLevelSet("web");
+    }
+  }
+}
+
 static void sendHttpJsonStatus(NetworkClient &client)
 {
   const ImuState imu = copyImuState();
   const BlackboxState blackbox = copyBlackboxState();
   char ip_text[20];
+  char blackbox_file[80];
+  char wifi_note[96];
+  char sensor_summary[220];
   formatIpAddress(g_wifi_ap_ip, ip_text, sizeof(ip_text));
+  sanitizeJsonText(blackbox.file_path[0] ? blackbox.file_path : "-", blackbox_file, sizeof(blackbox_file));
+  sanitizeJsonText(g_wifi_diag_note, wifi_note, sizeof(wifi_note));
+  sanitizeJsonText(g_sensor_compact_cache.c_str(), sensor_summary, sizeof(sensor_summary));
 
   client.print(F("HTTP/1.1 200 OK\r\n"));
   client.print(F("Content-Type: application/json; charset=utf-8\r\n"));
   client.print(F("Cache-Control: no-store\r\n"));
   client.print(F("Connection: close\r\n\r\n"));
   client.printf(
-      "{\"device\":\"StratosBrain S3\",\"wifi_ap\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"web_hits\":%lu,"
-      "\"uptime_s\":%lu,\"touch\":{\"pressed\":%s,\"x\":%u,\"y\":%u,\"count\":%lu},"
-      "\"imu\":{\"connected\":%s,\"healthy\":%s,\"pitch_deg\":%.1f,\"roll_deg\":%.1f},"
-      "\"blackbox\":{\"mounted\":%s,\"logging_enabled\":%s,\"records\":%lu,\"file\":\"%s\"}}\n",
+      "{\"device\":\"StratosBrain S3\",\"screen\":\"%s\",\"screen_label\":\"%s\","
+      "\"runtime_light\":%s,"
+      "\"wifi\":{\"ap\":%s,\"requested\":%s,\"ssid\":\"%s\",\"password\":\"%s\",\"ip\":\"%s\",\"clients\":%u,\"web_hits\":%lu,\"note\":\"%s\"},"
+      "\"uptime_s\":%lu,"
+      "\"touch\":{\"pressed\":%s,\"x\":%u,\"y\":%u,\"count\":%lu},"
+      "\"imu\":{\"connected\":%s,\"healthy\":%s,\"pitch_deg\":%.1f,\"roll_deg\":%.1f,\"temperature_c\":%.1f},"
+      "\"plane\":{\"altitude_ft\":null,\"vario_fpm\":null,\"heading_deg\":null,\"speed_kmh\":null},"
+      "\"meteo\":{\"theme\":\"demo\",\"summary\":\"Sensores meteorologicos ainda em integracao\"},"
+      "\"comms\":{\"lora_enabled\":%s,\"gps_fix\":false},"
+      "\"blackbox\":{\"mounted\":%s,\"logging_enabled\":%s,\"records\":%lu,\"file\":\"%s\"},"
+      "\"sensors\":{\"summary\":\"%s\"}}\n",
+      screenIdSlug(g_current_screen_id),
+      screenIdLabel(g_current_screen_id),
+      g_runtime_services_light ? "true" : "false",
       g_wifi_ap_started ? "true" : "false",
+      g_wifi_mode_requested ? "true" : "false",
       WIFI_AP_SSID,
+      WIFI_AP_PASSWORD,
       ip_text,
+      static_cast<unsigned>(wifiClientCount()),
       static_cast<unsigned long>(g_wifi_web_hits),
+      wifi_note,
       static_cast<unsigned long>(millis() / 1000UL),
       g_touch_pressed ? "true" : "false",
       static_cast<unsigned>(g_touch_x),
@@ -942,64 +1224,73 @@ static void sendHttpJsonStatus(NetworkClient &client)
       imu.healthy ? "true" : "false",
       imu.pitch_deg,
       imu.roll_deg,
+      imu.temperature_c,
+      g_lora_enabled ? "true" : "false",
       blackbox.mounted ? "true" : "false",
       blackbox.logging_enabled ? "true" : "false",
       static_cast<unsigned long>(blackbox.records_written),
-      blackbox.file_path[0] ? blackbox.file_path : "");
+      blackbox_file,
+      sensor_summary);
 }
 
 static void sendHttpDashboard(NetworkClient &client)
 {
-  const ImuState imu = copyImuState();
-  const BlackboxState blackbox = copyBlackboxState();
-  char ip_text[20];
-  char sd_size_text[24];
-  formatIpAddress(g_wifi_ap_ip, ip_text, sizeof(ip_text));
-  formatStorageSize(blackbox.card_size_bytes, sd_size_text, sizeof(sd_size_text));
-
   client.print(F("HTTP/1.1 200 OK\r\n"));
   client.print(F("Content-Type: text/html; charset=utf-8\r\n"));
   client.print(F("Cache-Control: no-store\r\n"));
   client.print(F("Connection: close\r\n\r\n"));
   client.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"));
   client.print(F("<meta name='viewport' content='width=device-width,initial-scale=1'>"));
-  client.print(F("<meta http-equiv='refresh' content='3'>"));
   client.print(F("<title>StratosBrain S3</title>"));
-  client.print(F("<style>body{margin:0;font-family:Arial,sans-serif;background:#070b11;color:#eef4ff;}"));
-  client.print(F(".wrap{padding:16px;max-width:760px;margin:0 auto;}"));
-  client.print(F(".hero{background:linear-gradient(180deg,#0f2034,#09121c);border:1px solid #235c8f;border-radius:18px;padding:16px;margin-bottom:14px;}"));
-  client.print(F(".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;}"));
-  client.print(F(".card{background:#0c141d;border:1px solid #223344;border-radius:16px;padding:14px;}"));
-  client.print(F(".k{color:#84d7ff;font-size:12px;text-transform:uppercase;letter-spacing:.08em;}"));
-  client.print(F(".v{font-size:24px;font-weight:700;margin-top:8px;}"));
-  client.print(F(".s{color:#b9c9d9;font-size:14px;line-height:1.4;}a{color:#7ed1ff;}</style></head><body>"));
-  client.print(F("<div class='wrap'><div class='hero'><div class='k'>StratosBrain S3</div>"));
-  client.printf("<div class='v'>AP %s</div>", g_wifi_ap_started ? "ativo" : "offline");
-  client.printf("<div class='s'>SSID: %s<br>Senha: %s<br>IP: <a href='http://%s'>http://%s</a><br>JSON: <a href='/api/status'>/api/status</a></div>",
-                WIFI_AP_SSID,
-                WIFI_AP_PASSWORD,
-                ip_text,
-                ip_text);
-  client.print(F("</div><div class='grid'>"));
-  client.printf("<div class='card'><div class='k'>Uptime</div><div class='v'>%lus</div><div class='s'>Requisicoes web: %lu</div></div>",
-                static_cast<unsigned long>(millis() / 1000UL),
-                static_cast<unsigned long>(g_wifi_web_hits));
-  client.printf("<div class='card'><div class='k'>IMU</div><div class='v'>%s</div><div class='s'>Pitch: %+.1f deg<br>Roll: %+.1f deg</div></div>",
-                imu.connected ? (imu.healthy ? "OK" : "WARN") : "OFF",
-                imu.pitch_deg,
-                imu.roll_deg);
-  client.printf("<div class='card'><div class='k'>Touch</div><div class='v'>%s</div><div class='s'>X:%u Y:%u<br>Toques: %lu</div></div>",
-                g_touch_pressed ? "ON" : "OFF",
-                static_cast<unsigned>(g_touch_x),
-                static_cast<unsigned>(g_touch_y),
-                static_cast<unsigned long>(g_touch_press_count));
-  client.printf("<div class='card'><div class='k'>SD / Blackbox</div><div class='v'>%s</div><div class='s'>Modo: %s<br>Capacidade: %s<br>Arquivo: %s<br>Registros: %lu</div></div>",
-                blackbox.mounted ? "montado" : "sem cartao",
-                blackbox.logging_enabled ? "armado" : "pausado",
-                sd_size_text,
-                blackbox.file_path[0] ? blackbox.file_path : "-",
-                static_cast<unsigned long>(blackbox.records_written));
-  client.print(F("</div></div></body></html>"));
+  client.print(F("<style>:root{--bg:#071019;--panel:#0d1823;--panel2:#101f2d;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59;}*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text)}a{color:#8bddff}.wrap{padding:16px;max-width:1120px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:6px 0 10px;font-size:34px}.hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:10px}.mini{background:rgba(7,14,21,.45);border:1px solid rgba(111,214,255,.18);border-radius:14px;padding:10px 12px}.mini b{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}.btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.small{padding:8px 12px;font-size:13px}.tabs{margin:14px 0}.tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:var(--panel);border:1px solid #21364a;border-radius:18px;padding:14px}.card h3{margin:0 0 10px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}.big{font-size:31px;font-weight:700;margin:6px 0}.muted{color:var(--muted);font-size:14px;line-height:1.45}.section{display:none}.section.active{display:block}.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#123046;border:1px solid #275779;color:#dff6ff;font-size:12px;font-weight:700}.ok{color:var(--ok)}.warnc{color:var(--warn)}.mono{font-family:Consolas,monospace}.footer{margin-top:14px;color:var(--muted);font-size:12px}</style></head><body>"));
+  client.print(F("<div class='wrap'><div class='hero'><div class='eyebrow'>StratosBrain S3</div><h1>Console Web</h1>"));
+  client.print(F("<div class='hero-grid'>"));
+  client.print(F("<div class='mini'><b>Wi-Fi AP</b><span id='heroWifi'>--</span></div>"));
+  client.print(F("<div class='mini'><b>SSID / Senha</b><span class='mono' id='heroCreds'>--</span></div>"));
+  client.print(F("<div class='mini'><b>IP / Tela ativa</b><span class='mono' id='heroIp'>--</span></div>"));
+  client.print(F("<div class='mini'><b>Modo</b><span id='heroMode'>--</span></div>"));
+  client.print(F("</div>"));
+  client.print(F("<div class='actions'>"));
+  client.print(F("<button class='btn' onclick=\"act('screen=home')\">Home</button>"));
+  client.print(F("<button class='btn' onclick=\"act('screen=plane')\">Plane</button>"));
+  client.print(F("<button class='btn' onclick=\"act('screen=meteo')\">Meteo</button>"));
+  client.print(F("<button class='btn' onclick=\"act('screen=comms')\">Comms</button>"));
+  client.print(F("<button class='btn' onclick=\"act('screen=config')\">Config</button>"));
+  client.print(F("<button class='btn alt' onclick=\"act('wifi=toggle')\">Wi-Fi on/off</button>"));
+  client.print(F("<button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button>"));
+  client.print(F("<button class='btn small' onclick=\"act('rescan=1')\">Rescan</button>"));
+  client.print(F("</div></div>"));
+  client.print(F("<div class='tabs'>"));
+  client.print(F("<button class='btn tab active' data-tab='overview' onclick=\"setTab('overview')\">Overview</button>"));
+  client.print(F("<button class='btn tab' data-tab='plane' onclick=\"setTab('plane')\">Plane</button>"));
+  client.print(F("<button class='btn tab' data-tab='meteo' onclick=\"setTab('meteo')\">Meteo</button>"));
+  client.print(F("<button class='btn tab' data-tab='comms' onclick=\"setTab('comms')\">Comms</button>"));
+  client.print(F("<button class='btn tab' data-tab='config' onclick=\"setTab('config')\">Config</button>"));
+  client.print(F("</div>"));
+  client.print(F("<section class='section active' id='section-overview'><div class='grid'>"));
+  client.print(F("<div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes: <span id='ovClients'>--</span></div></div>"));
+  client.print(F("<div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div>"));
+  client.print(F("<div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div>"));
+  client.print(F("<div class='card'><h3>SD / Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div>"));
+  client.print(F("</div></section>"));
+  client.print(F("<section class='section' id='section-plane'><div class='split'>"));
+  client.print(F("<div class='card'><h3>PLANE</h3><div class='kv'><div><div class='muted'>Pitch</div><div class='big' id='plPitch'>--</div></div><div><div class='muted'>Roll</div><div class='big' id='plRoll'>--</div></div><div><div class='muted'>ALT</div><div class='big' id='plAlt'>--</div></div><div><div class='muted'>V/S</div><div class='big' id='plVario'>--</div></div><div><div class='muted'>HDG</div><div class='big' id='plHdg'>--</div></div><div><div class='muted'>SPD</div><div class='big' id='plSpd'>--</div></div></div></div>"));
+  client.print(F("<div class='card'><h3>Controles</h3><div class='muted'>Use esta area para abrir a tela de voo no dispositivo e calibrar o nivel atual do IMU.</div><div class='actions'><button class='btn' onclick=\"act('screen=plane')\">Abrir PLANE</button><button class='btn alt' onclick=\"act('level=1')\">Setar nivel</button></div><div class='footer'>Ate conectar BMP581, GPS e BMM350, alguns instrumentos seguem como placeholder.</div></div>"));
+  client.print(F("</div></section>"));
+  client.print(F("<section class='section' id='section-meteo'><div class='split'>"));
+  client.print(F("<div class='card'><h3>METEO</h3><div class='big' id='mtTheme'>--</div><div class='muted' id='mtSummary'>--</div></div>"));
+  client.print(F("<div class='card'><h3>Sensores</h3><div class='muted' id='mtSensors'>--</div><div class='actions'><button class='btn small' onclick=\"act('screen=meteo')\">Abrir METEO</button><button class='btn small' onclick=\"act('rescan=1')\">Atualizar sensores</button></div></div>"));
+  client.print(F("</div></section>"));
+  client.print(F("<section class='section' id='section-comms'><div class='split'>"));
+  client.print(F("<div class='card'><h3>Rede</h3><div class='muted'>SSID: <span class='mono' id='cmSsid'>--</span><br>Senha: <span class='mono' id='cmPass'>--</span><br>IP: <span class='mono' id='cmIp'>--</span><br>Clientes: <span id='cmClients'>--</span><br>Nota: <span id='cmNote'>--</span></div></div>"));
+  client.print(F("<div class='card'><h3>Radio e GPS</h3><div class='muted'>LoRa: <span id='cmLora'>--</span><br>GPS: <span id='cmGps'>placeholder</span></div><div class='actions'><button class='btn alt' onclick=\"act('wifi=toggle')\">Wi-Fi on/off</button><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('screen=comms')\">Abrir COMMS</button></div></div>"));
+  client.print(F("</div></section>"));
+  client.print(F("<section class='section' id='section-config'><div class='split'>"));
+  client.print(F("<div class='card'><h3>CONFIG</h3><div class='muted'>Tela ativa: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Logger: <span id='cfLogger'>--</span></div><div class='actions'><button class='btn' onclick=\"act('screen=config')\">Abrir CONFIG</button><button class='btn small' onclick=\"act('logger=toggle')\">Pausar/ligar logger</button></div></div>"));
+  client.print(F("<div class='card'><h3>Arquivo e sensores</h3><div class='muted'>Arquivo atual: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Sensores: <span id='cfSensors'>--</span></div></div>"));
+  client.print(F("</div></section>"));
+  client.print(F("<script>const $=i=>document.getElementById(i);let tab='overview';function setTab(n){tab=n;document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}function act(q){fetch('/api/action?'+q,{cache:'no-store'}).then(()=>setTimeout(refresh,180)).catch(()=>setTimeout(refresh,600));}function txt(v,d='--'){return(v===undefined||v===null||v==='')?d:v;}function yes(v,a='ON',b='OFF'){return v?a:b;}function num(v,s=''){return(v===undefined||v===null)?'--':String(v)+s;}function refresh(){fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{$('heroWifi').textContent=yes(d.wifi.ap,'AP ativo','AP offline');$('heroCreds').textContent=d.wifi.ssid+' / '+d.wifi.password;$('heroIp').textContent=d.wifi.ip+' / '+d.screen_label;$('heroMode').textContent=d.runtime_light?'modo leve':'cockpit completo';$('ovUptime').textContent=num(d.uptime_s,'s');$('ovHits').textContent=txt(d.wifi.web_hits);$('ovClients').textContent=txt(d.wifi.clients);$('ovImu').textContent=d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF';$('ovPitch').textContent=num(d.imu.pitch_deg,' deg');$('ovRoll').textContent=num(d.imu.roll_deg,' deg');$('ovTemp').textContent=num(d.imu.temperature_c,' C');$('ovTouch').textContent=yes(d.touch.pressed,'ON','OFF');$('ovTouchXY').textContent=txt(d.touch.x)+','+txt(d.touch.y);$('ovTouchCount').textContent=txt(d.touch.count);$('ovSd').textContent=yes(d.blackbox.mounted,'montado','sem cartao');$('ovLogger').textContent=yes(d.blackbox.logging_enabled,'ligado','pausado');$('ovFile').textContent=txt(d.blackbox.file);$('ovRecords').textContent=txt(d.blackbox.records);$('plPitch').textContent=num(d.imu.pitch_deg,' deg');$('plRoll').textContent=num(d.imu.roll_deg,' deg');$('plAlt').textContent='---- ft';$('plVario').textContent='---- fpm';$('plHdg').textContent='--- dg';$('plSpd').textContent='-- km/h';$('mtTheme').textContent=txt(d.meteo.theme);$('mtSummary').textContent=txt(d.meteo.summary);$('mtSensors').textContent=txt(d.sensors.summary);$('cmSsid').textContent=txt(d.wifi.ssid);$('cmPass').textContent=txt(d.wifi.password);$('cmIp').textContent=txt(d.wifi.ip);$('cmClients').textContent=txt(d.wifi.clients);$('cmNote').textContent=txt(d.wifi.note);$('cmLora').textContent=yes(d.comms.lora_enabled,'ON','OFF');$('cfScreen').textContent=txt(d.screen_label);$('cfMode').textContent=d.runtime_light?'leve':'normal';$('cfLogger').textContent=yes(d.blackbox.logging_enabled,'ligado','pausado');$('cfFile').textContent=txt(d.blackbox.file);$('cfRecords').textContent=txt(d.blackbox.records);$('cfSensors').textContent=txt(d.sensors.summary);}).catch(()=>{});}setTab('overview');refresh();setInterval(refresh,1800);</script>"));
+  client.print(F("</div></body></html>"));
 }
 
 static void handleWifiPortal()
@@ -1036,7 +1327,16 @@ static void handleWifiPortal()
   g_wifi_web_hits += 1;
   g_wifi_last_client_ms = millis();
 
-  if (strncmp(request_line, "GET /api/status", 15) == 0) {
+  char request_path[160];
+  if (!parseHttpPath(request_line, request_path, sizeof(request_path))) {
+    client.stop();
+    return;
+  }
+
+  if (strncmp(request_path, "/api/action", 11) == 0) {
+    handleHttpActionPath(request_path);
+    sendHttpJsonStatus(client);
+  } else if (strncmp(request_path, "/api/status", 11) == 0) {
     sendHttpJsonStatus(client);
   } else {
     sendHttpDashboard(client);
