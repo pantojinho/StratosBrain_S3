@@ -1,0 +1,9 @@
+.build_lvgl9/
+_build_stratos_wifi/
+_build_validate/
+_tmp_wifi_compile/
+
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
