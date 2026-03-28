@@ -2,9 +2,6 @@
 
 Wearable cockpit, meteo station and field telemetry OS for the Waveshare `ESP32-S3 Touch AMOLED 1.64`.
 
-## Root oficial
-
-- `C:\Esp32\CLAUDE\StratosBrain_S3`
 
 ## Firmware oficial
 
@@ -54,6 +51,8 @@ Itens removidos do escopo atual:
   firmware principal
 - `ESQUEMA_LIGACOES.md`
   guia de ligacao dos modulos usados
+- `GP10_NOTAS_RAPIDAS.md`
+  resumo pratico do GPS `GP10`, baud, NMEA e comandos `PCAS`
 - `ARQUITETURA_TECNICA.md`
   arquitetura atual do software
 - `MENU_UI_IDEIAS.md`

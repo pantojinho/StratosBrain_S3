@@ -66,6 +66,19 @@ Itens removidos do projeto:
   - `NUBLADO`
   - `CHUVA PROVAVEL`
 - `GPS` com parser basico de NMEA
+- `GPS GP10` revisado contra a documentacao oficial:
+  - `9600 8N1` por padrao
+  - `1Hz` por padrao
+  - comandos `PCAS` confirmados para `baud`, `update rate`, `restart` e constelacao
+  - breakout `DX-PJ17` alimentado em `5V`
+- aba `GPS` da web com diagnostico melhor de ligacao e controles de bancada:
+  - `Cold Start`
+  - `Hot Start`
+  - `1Hz`
+  - `5Hz`
+  - `All GNSS`
+  - `GPS+BDS`
+  - `All NMEA ON`
 - `LoRa UART` com console web de payload
 - logger `CSV` em `microSD`
 - serial monitor com diagnostico continuo de `BME688`, `GPS` e `LoRa`

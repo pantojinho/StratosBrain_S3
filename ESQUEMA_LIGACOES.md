@@ -34,8 +34,8 @@ Uso:
 
 ### UART do GPS
 
-- `ESP TX = GPIO43`
-- `ESP RX = GPIO44`
+- `ESP RX = GPIO43`
+- `ESP TX = GPIO44`
 
 ### UART do LoRa
 
@@ -146,8 +146,8 @@ Existem dois cenarios:
 
 - `VCC -> 3V3`
 - `GND -> GND`
-- `TX do GPS -> GPIO44 (RX do ESP)`
-- `RX do GPS -> GPIO43 (TX do ESP)`
+- `TX do GPS -> GPIO43 (RX do ESP)`
+- `RX do GPS -> GPIO44 (TX do ESP)`
 
 ### GPS breakout/adaptador 5V
 
@@ -155,13 +155,14 @@ Se for aquela placa adaptadora do anuncio com `VCC = 5V`:
 
 - `VCC -> 5V`
 - `GND -> GND`
-- `TXD do GPS -> GPIO44 (RX do ESP)`
-- `RXD do GPS -> GPIO43 (TX do ESP)`
+- `TXD do GPS -> GPIO43 (TX do ESP)`
+- `RXD do GPS -> GPIO44 (RX do ESP)`
 
 Observacao:
 
 - O mais importante no primeiro teste eh `TX do GPS -> RX do ESP`.
 - Alguns modulos funcionam no primeiro teste mesmo sem ligar o `RX` do GPS.
+- O `GP10` trabalha por padrao em `9600 8N1`.
 
 Onde aparece no software:
 

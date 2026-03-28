@@ -147,6 +147,10 @@ static constexpr uint32_t BLACKBOX_FLUSH_PERIOD_MS = 5000U;
 static constexpr uint32_t SD_PURGE_CONFIRM_MS = 8000U;
 static constexpr uint8_t BLACKBOX_TAIL_LINE_COUNT = 5;
 static constexpr size_t BLACKBOX_TAIL_LINE_LEN = 220;
+static constexpr uint8_t ACTIVITY_HISTORY_LINE_COUNT = 12;
+static constexpr size_t ACTIVITY_HISTORY_LINE_LEN = 140;
+static constexpr uint8_t GPS_ACTIVITY_LINE_COUNT = 10;
+static constexpr size_t GPS_ACTIVITY_LINE_LEN = 140;
 static constexpr uint8_t LORA_HISTORY_LINE_COUNT = 16;
 static constexpr size_t LORA_HISTORY_LINE_LEN = 140;
 static constexpr uint32_t BOOT_BUTTON_GUARD_MS = 2500U;
@@ -321,6 +325,12 @@ static char g_wifi_sta_note[BLACKBOX_NOTE_LEN] = "LAN desligada";
 static char g_blackbox_tail_lines[BLACKBOX_TAIL_LINE_COUNT][BLACKBOX_TAIL_LINE_LEN] = {};
 static uint8_t g_blackbox_tail_count = 0;
 static uint8_t g_blackbox_tail_head = 0;
+static char g_activity_history_lines[ACTIVITY_HISTORY_LINE_COUNT][ACTIVITY_HISTORY_LINE_LEN] = {};
+static uint8_t g_activity_history_count = 0;
+static uint8_t g_activity_history_head = 0;
+static char g_gps_activity_lines[GPS_ACTIVITY_LINE_COUNT][GPS_ACTIVITY_LINE_LEN] = {};
+static uint8_t g_gps_activity_count = 0;
+static uint8_t g_gps_activity_head = 0;
 static char g_lora_history_lines[LORA_HISTORY_LINE_COUNT][LORA_HISTORY_LINE_LEN] = {};
 static uint8_t g_lora_history_count = 0;
 static uint8_t g_lora_history_head = 0;
@@ -336,6 +346,46 @@ static char g_gps_line_buffer[128] = {};
 static size_t g_gps_line_len = 0;
 static char g_lora_line_buffer[128] = {};
 static size_t g_lora_line_len = 0;
+
+struct HttpJsonScratch
+{
+  char ip_text[20];
+  char ap_ip_text[20];
+  char sta_ip_text[20];
+  char blackbox_file[80];
+  char blackbox_name[40];
+  char blackbox_note[80];
+  char blackbox_tail[1200];
+  char wifi_note[96];
+  char wifi_sta_note[96];
+  char wifi_sta_ssid[96];
+  char bme_note[96];
+  char meteo_summary[160];
+  char meteo_theme[64];
+  char sensor_summary[220];
+  char sensor_known[220];
+  char sensor_scan_raw[220];
+  char sensor_bosch[240];
+  char sensor_routes[220];
+  char gps_note[96];
+  char gps_sentence[112];
+  char gps_config_note[96];
+  char gps_last_command[48];
+  char gps_map_osm[220];
+  char gps_map_google[220];
+  char gps_map_hint[160];
+  char gps_power_hint[120];
+  char gps_wiring_hint[160];
+  char gps_history[1500];
+  char lora_note[96];
+  char lora_message[112];
+  char lora_history[1800];
+  char activity_history[1800];
+  char plane_altitude_ft_text[24];
+  char plane_speed_kmh_text[24];
+};
+
+static HttpJsonScratch g_http_json_scratch = {};
 
 struct ImuState
 {
@@ -395,6 +445,7 @@ struct GpsState
   bool has_location;
   bool sentence_seen;
   uint8_t sats;
+  uint8_t update_rate_hz;
   uint32_t rx_bytes;
   uint32_t line_count;
   uint32_t last_rx_ms;
@@ -405,6 +456,8 @@ struct GpsState
   float speed_kmh;
   char last_sentence[96];
   char note[96];
+  char config_note[96];
+  char last_command[48];
 };
 
 struct LoraState
@@ -426,6 +479,7 @@ static portMUX_TYPE g_blackbox_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_bme688_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_gps_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_lora_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_activity_mux = portMUX_INITIALIZER_UNLOCKED;
 static ImuState g_imu_state = {};
 static BlackboxState g_blackbox_state = {};
 static Bme68x g_bme688;
@@ -637,6 +691,172 @@ static void formatBlackboxTailJson(char *buffer, size_t buffer_len)
   buffer[out] = '\0';
 }
 
+static void clearActivityHistory()
+{
+  portENTER_CRITICAL(&g_activity_mux);
+  g_activity_history_count = 0;
+  g_activity_history_head = 0;
+  for (uint8_t i = 0; i < ACTIVITY_HISTORY_LINE_COUNT; ++i) {
+    g_activity_history_lines[i][0] = '\0';
+  }
+  portEXIT_CRITICAL(&g_activity_mux);
+}
+
+static void appendActivityLine(const char *tag, const char *payload)
+{
+  if ((!tag || !tag[0]) && (!payload || !payload[0])) {
+    return;
+  }
+
+  char line[ACTIVITY_HISTORY_LINE_LEN];
+  snprintf(
+      line,
+      sizeof(line),
+      "%lus | %s | %s",
+      static_cast<unsigned long>(millis() / 1000UL),
+      (tag && tag[0]) ? tag : "?",
+      (payload && payload[0]) ? payload : "-");
+
+  portENTER_CRITICAL(&g_activity_mux);
+  snprintf(
+      g_activity_history_lines[g_activity_history_head],
+      ACTIVITY_HISTORY_LINE_LEN,
+      "%s",
+      line);
+  g_activity_history_head = static_cast<uint8_t>((g_activity_history_head + 1U) % ACTIVITY_HISTORY_LINE_COUNT);
+  if (g_activity_history_count < ACTIVITY_HISTORY_LINE_COUNT) {
+    g_activity_history_count += 1U;
+  }
+  portEXIT_CRITICAL(&g_activity_mux);
+}
+
+static void formatActivityHistoryJson(char *buffer, size_t buffer_len)
+{
+  if (!buffer || buffer_len == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  size_t out = 0;
+
+  portENTER_CRITICAL(&g_activity_mux);
+  const uint8_t count = g_activity_history_count;
+  const uint8_t head = g_activity_history_head;
+
+  for (uint8_t i = 0; i < count && out < (buffer_len - 1U); ++i) {
+    const uint8_t index = static_cast<uint8_t>((head + ACTIVITY_HISTORY_LINE_COUNT - count + i) % ACTIVITY_HISTORY_LINE_COUNT);
+    const char *line = g_activity_history_lines[index];
+    for (size_t j = 0; line[j] != '\0' && out < (buffer_len - 1U); ++j) {
+      const char c = line[j];
+      if (c == '"' || c == '\\') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = c;
+      } else if (c == '\n' || c == '\r') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = 'n';
+      } else {
+        buffer[out++] = c;
+      }
+    }
+    if ((i + 1U) < count && out < (buffer_len - 2U)) {
+      buffer[out++] = '\\';
+      buffer[out++] = 'n';
+    }
+  }
+  portEXIT_CRITICAL(&g_activity_mux);
+
+  buffer[out] = '\0';
+}
+
+static void clearGpsActivityHistory()
+{
+  portENTER_CRITICAL(&g_activity_mux);
+  g_gps_activity_count = 0;
+  g_gps_activity_head = 0;
+  for (uint8_t i = 0; i < GPS_ACTIVITY_LINE_COUNT; ++i) {
+    g_gps_activity_lines[i][0] = '\0';
+  }
+  portEXIT_CRITICAL(&g_activity_mux);
+}
+
+static void appendGpsActivityLine(const char *tag, const char *payload)
+{
+  if ((!tag || !tag[0]) && (!payload || !payload[0])) {
+    return;
+  }
+
+  char line[GPS_ACTIVITY_LINE_LEN];
+  snprintf(
+      line,
+      sizeof(line),
+      "%lus | %s | %s",
+      static_cast<unsigned long>(millis() / 1000UL),
+      (tag && tag[0]) ? tag : "GPS",
+      (payload && payload[0]) ? payload : "-");
+
+  portENTER_CRITICAL(&g_activity_mux);
+  snprintf(
+      g_gps_activity_lines[g_gps_activity_head],
+      GPS_ACTIVITY_LINE_LEN,
+      "%s",
+      line);
+  g_gps_activity_head = static_cast<uint8_t>((g_gps_activity_head + 1U) % GPS_ACTIVITY_LINE_COUNT);
+  if (g_gps_activity_count < GPS_ACTIVITY_LINE_COUNT) {
+    g_gps_activity_count += 1U;
+  }
+  portEXIT_CRITICAL(&g_activity_mux);
+}
+
+static void formatGpsActivityJson(char *buffer, size_t buffer_len)
+{
+  if (!buffer || buffer_len == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  size_t out = 0;
+
+  portENTER_CRITICAL(&g_activity_mux);
+  const uint8_t count = g_gps_activity_count;
+  const uint8_t head = g_gps_activity_head;
+
+  for (uint8_t i = 0; i < count && out < (buffer_len - 1U); ++i) {
+    const uint8_t index = static_cast<uint8_t>((head + GPS_ACTIVITY_LINE_COUNT - count + i) % GPS_ACTIVITY_LINE_COUNT);
+    const char *line = g_gps_activity_lines[index];
+    for (size_t j = 0; line[j] != '\0' && out < (buffer_len - 1U); ++j) {
+      const char c = line[j];
+      if (c == '"' || c == '\\') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = c;
+      } else if (c == '\n' || c == '\r') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = 'n';
+      } else {
+        buffer[out++] = c;
+      }
+    }
+    if ((i + 1U) < count && out < (buffer_len - 2U)) {
+      buffer[out++] = '\\';
+      buffer[out++] = 'n';
+    }
+  }
+  portEXIT_CRITICAL(&g_activity_mux);
+
+  buffer[out] = '\0';
+}
+
 static void clearLoraHistory()
 {
   portENTER_CRITICAL(&g_lora_mux);
@@ -824,6 +1044,154 @@ static float parseNmeaCoordinate(const char *value, const char hemisphere)
   return coordinate;
 }
 
+static uint8_t computeNmeaChecksum(const char *payload)
+{
+  uint8_t checksum = 0U;
+  if (!payload) {
+    return checksum;
+  }
+
+  while (*payload) {
+    checksum ^= static_cast<uint8_t>(*payload++);
+  }
+  return checksum;
+}
+
+static bool sendGpsPcasCommand(const char *payload, const char *label, const char *origin)
+{
+  if (!payload || !payload[0] || !g_gps_uart_ready) {
+    GpsState state = copyGpsState();
+    snprintf(state.config_note, sizeof(state.config_note), "Falha ao enviar %s", label ? label : "comando");
+    storeGpsState(state);
+    Serial.printf("[GPS] Falha ao enviar %s via %s\n", label ? label : "comando", origin ? origin : "sistema");
+    return false;
+  }
+
+  const uint8_t checksum = computeNmeaChecksum(payload);
+  char command[96];
+  snprintf(command, sizeof(command), "$%s*%02X\r\n", payload, checksum);
+  const size_t written = Serial1.print(command);
+
+  GpsState state = copyGpsState();
+  snprintf(state.last_command, sizeof(state.last_command), "%s", label ? label : payload);
+  snprintf(
+      state.config_note,
+      sizeof(state.config_note),
+      "Comando %s enviado via %s",
+      label ? label : payload,
+      origin ? origin : "sistema");
+  storeGpsState(state);
+  appendGpsActivityLine("CMD", label ? label : payload);
+  appendActivityLine("GPS", label ? label : payload);
+
+  Serial.printf(
+      "[GPS] CMD via %s | %s | raw=%s | bytes=%u\n",
+      origin ? origin : "sistema",
+      label ? label : payload,
+      command,
+      static_cast<unsigned>(written));
+  return written > 0U;
+}
+
+static void requestGpsRateHz(uint8_t rate_hz, const char *origin)
+{
+  const char *payload = nullptr;
+  switch (rate_hz) {
+    case 1:
+      payload = "PCAS02,1000";
+      break;
+    case 2:
+      payload = "PCAS02,500";
+      break;
+    case 4:
+      payload = "PCAS02,250";
+      break;
+    case 5:
+      payload = "PCAS02,200";
+      break;
+    case 10:
+      payload = "PCAS02,100";
+      break;
+    default:
+      return;
+  }
+
+  if (sendGpsPcasCommand(payload, rate_hz == 1 ? "rate 1Hz" : rate_hz == 2 ? "rate 2Hz"
+                                                   : rate_hz == 4   ? "rate 4Hz"
+                                                   : rate_hz == 5   ? "rate 5Hz"
+                                                                    : "rate 10Hz",
+                         origin)) {
+    GpsState state = copyGpsState();
+    state.update_rate_hz = rate_hz;
+    snprintf(state.config_note, sizeof(state.config_note), "Update rate configurado para %uHz", static_cast<unsigned>(rate_hz));
+    storeGpsState(state);
+  }
+}
+
+static void requestGpsRestartMode(uint8_t mode, const char *origin)
+{
+  const char *payload = nullptr;
+  const char *label = nullptr;
+  switch (mode) {
+    case 0:
+      payload = "PCAS10,0";
+      label = "hot start";
+      break;
+    case 1:
+      payload = "PCAS10,1";
+      label = "warm start";
+      break;
+    case 2:
+      payload = "PCAS10,2";
+      label = "cold start";
+      break;
+    case 3:
+      payload = "PCAS10,3";
+      label = "factory start";
+      break;
+    default:
+      return;
+  }
+
+  sendGpsPcasCommand(payload, label, origin);
+}
+
+static void requestGpsConstellationMode(uint8_t mode, const char *origin)
+{
+  const char *payload = nullptr;
+  const char *label = nullptr;
+  switch (mode) {
+    case 1:
+      payload = "PCAS04,1";
+      label = "GPS";
+      break;
+    case 3:
+      payload = "PCAS04,3";
+      label = "GPS+BDS";
+      break;
+    case 5:
+      payload = "PCAS04,5";
+      label = "GPS+GLONASS";
+      break;
+    case 7:
+      payload = "PCAS04,7";
+      label = "GPS+BDS+GLONASS";
+      break;
+    default:
+      return;
+  }
+
+  sendGpsPcasCommand(payload, label, origin);
+}
+
+static void requestGpsAllNmea(bool enable, const char *origin)
+{
+  sendGpsPcasCommand(
+      enable ? "PCAS03,1,1,1,1,1,1,1,1,1,1,,,1,1" : "PCAS03,0,0,0,0,0,0,0,0,0,0,,,0,0",
+      enable ? "all NMEA on" : "all NMEA off",
+      origin);
+}
+
 static void finalizeGpsSentence(char *sentence)
 {
   if (!sentence || sentence[0] == '\0' || sentence[0] != '$') {
@@ -831,6 +1199,8 @@ static void finalizeGpsSentence(char *sentence)
   }
 
   GpsState state = copyGpsState();
+  const bool had_sentence = state.sentence_seen;
+  const bool had_fix = state.has_fix;
   const uint32_t now = millis();
   state.uart_ready = g_gps_uart_ready;
   state.sentence_seen = true;
@@ -897,6 +1267,25 @@ static void finalizeGpsSentence(char *sentence)
   }
 
   state.receiving = true;
+  if (!had_sentence) {
+    appendGpsActivityLine("NMEA", "primeira sentenca recebida");
+    appendActivityLine("GPS", "primeira sentenca NMEA");
+  }
+  if (!had_fix && state.has_fix) {
+    char fix_line[96];
+    snprintf(
+        fix_line,
+        sizeof(fix_line),
+        "fix ganho | %u sats | %.5f %.5f",
+        static_cast<unsigned>(state.sats),
+        state.latitude_deg,
+        state.longitude_deg);
+    appendGpsActivityLine("FIX", fix_line);
+    appendActivityLine("GPS", "fix valido adquirido");
+  } else if (had_fix && !state.has_fix) {
+    appendGpsActivityLine("FIX", "fix perdido");
+    appendActivityLine("GPS", "fix perdido");
+  }
   if (state.has_fix) {
     snprintf(
         state.note,
@@ -986,6 +1375,7 @@ static void finalizeLoraMessage(char *message)
   snprintf(state.note, sizeof(state.note), "RX %lu bytes | ultima msg pronta", static_cast<unsigned long>(state.rx_bytes));
   storeLoraState(state);
   appendLoraHistoryLine("RX", message);
+  appendActivityLine("LORA", "payload RX");
   Serial.printf("[LORA] RX: %s\n", message);
 }
 
@@ -1091,6 +1481,7 @@ static void requestLoraTestSend(const char *payload, const char *origin)
       payload);
   storeLoraState(state);
   appendLoraHistoryLine("TX", payload);
+  appendActivityLine("LORA", payload);
   Serial.printf("[LORA] Envio via %s: %s\n", origin ? origin : "sistema", payload);
 }
 
@@ -1528,10 +1919,12 @@ static void onWifiEvent(void *, esp_event_base_t event_base, int32_t event_id, v
     g_wifi_ap_started = true;
     refreshWifiApIp();
     snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP ativo em http://192.168.4.1");
+    appendActivityLine("WIFI", "AP_START");
     Serial.println("[WIFI] Evento AP_START");
   } else if (event_id == WIFI_EVENT_AP_STOP) {
     g_wifi_ap_started = false;
     g_wifi_web_started = false;
+    appendActivityLine("WIFI", "AP_STOP");
     if (g_wifi_ap_requested) {
       g_wifi_apply_pending = true;
       g_wifi_recover_request_ms = millis();
@@ -2158,6 +2551,7 @@ static void requestWifiStaMode(bool enable, const char *origin)
   g_wifi_sta_requested = enable;
   updateWifiRequestedFlag();
   g_wifi_apply_pending = true;
+  appendActivityLine("WIFI", enable ? "STA ON" : "STA OFF");
   Serial.printf("[WIFI] STA via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
   updateRuntimeServiceMode();
 }
@@ -2173,8 +2567,10 @@ static void requestWifiStaCredentials(const char *ssid, const char *password, co
 
   if (g_wifi_sta_ssid[0]) {
     snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "Credenciais LAN prontas para %s", g_wifi_sta_ssid);
+    appendActivityLine("WIFI", g_wifi_sta_ssid);
   } else {
     snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "SSID LAN limpo");
+    appendActivityLine("WIFI", "SSID limpo");
   }
   Serial.printf("[WIFI] Credenciais STA atualizadas via %s | SSID=%s\n", origin ? origin : "sistema", g_wifi_sta_ssid[0] ? g_wifi_sta_ssid : "-");
 }
@@ -2195,6 +2591,7 @@ static void requestLoraMode(bool enable, const char *origin)
       sizeof(state.note),
       enable ? "LoRa habilitado | aguardando trafego" : "LoRa desabilitado");
   storeLoraState(state);
+  appendActivityLine("LORA", enable ? "ON" : "OFF");
   Serial.printf("[LORA] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
 }
 
@@ -2202,6 +2599,7 @@ static void requestCommsRescan(const char *origin)
 {
   g_blackbox_remount_requested = true;
   refreshSensorCaches();
+  appendActivityLine("SYS", "rescan solicitado");
   Serial.printf("[COMMS] Rescan solicitado via %s\n", origin ? origin : "sistema");
   printWifiStatus("Rescan");
 }
@@ -2209,6 +2607,7 @@ static void requestCommsRescan(const char *origin)
 static void requestLoggerToggle(const char *origin)
 {
   g_blackbox_enabled_target = !g_blackbox_enabled_target;
+  appendActivityLine("SD", g_blackbox_enabled_target ? "logger ON" : "logger OFF");
   Serial.printf("[BLACKBOX] Toggle via %s: %s\n", origin ? origin : "sistema", g_blackbox_enabled_target ? "ON" : "OFF");
 }
 
@@ -2285,6 +2684,52 @@ static void handleHttpActionPath(const char *path)
     }
   }
 
+  if (httpQueryValue(path, "gps_rate", value, sizeof(value))) {
+    if (strcmp(value, "1") == 0) {
+      requestGpsRateHz(1, "web");
+    } else if (strcmp(value, "2") == 0) {
+      requestGpsRateHz(2, "web");
+    } else if (strcmp(value, "4") == 0) {
+      requestGpsRateHz(4, "web");
+    } else if (strcmp(value, "5") == 0) {
+      requestGpsRateHz(5, "web");
+    } else if (strcmp(value, "10") == 0) {
+      requestGpsRateHz(10, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "gps_restart", value, sizeof(value))) {
+    if (strcmp(value, "hot") == 0) {
+      requestGpsRestartMode(0, "web");
+    } else if (strcmp(value, "warm") == 0) {
+      requestGpsRestartMode(1, "web");
+    } else if (strcmp(value, "cold") == 0) {
+      requestGpsRestartMode(2, "web");
+    } else if (strcmp(value, "factory") == 0) {
+      requestGpsRestartMode(3, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "gps_constellation", value, sizeof(value))) {
+    if (strcmp(value, "gps") == 0) {
+      requestGpsConstellationMode(1, "web");
+    } else if (strcmp(value, "gps_bds") == 0) {
+      requestGpsConstellationMode(3, "web");
+    } else if (strcmp(value, "gps_glo") == 0) {
+      requestGpsConstellationMode(5, "web");
+    } else if (strcmp(value, "all") == 0) {
+      requestGpsConstellationMode(7, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "gps_nmea", value, sizeof(value))) {
+    if (strcmp(value, "all_on") == 0) {
+      requestGpsAllNmea(true, "web");
+    } else if (strcmp(value, "all_off") == 0) {
+      requestGpsAllNmea(false, "web");
+    }
+  }
+
   if (httpQueryValue(path, "lora_tx", value, sizeof(value))) {
     if (strcmp(value, "ping") == 0) {
       requestLoraTestSend("PING STRATOSBRAIN", "web");
@@ -2307,6 +2752,7 @@ static void handleHttpActionPath(const char *path)
       LoraState state = copyLoraState();
       snprintf(state.note, sizeof(state.note), "Console LoRa limpo via web");
       storeLoraState(state);
+      appendActivityLine("LORA", "console limpo");
       Serial.println("[LORA] Console web limpo");
     }
   }
@@ -2326,6 +2772,7 @@ static void handleHttpActionPath(const char *path)
   if (httpQueryValue(path, "sd", value, sizeof(value))) {
     if (strcmp(value, "remount") == 0) {
       g_blackbox_remount_requested = true;
+      appendActivityLine("SD", "remount solicitado");
       Serial.println("[BLACKBOX] Remount solicitado via web");
     }
   }
@@ -2344,80 +2791,68 @@ static void sendHttpJsonStatus(NetworkClient &client)
   const Bme688State bme = copyBme688State();
   const GpsState gps = copyGpsState();
   const LoraState lora = copyLoraState();
-  char ip_text[20];
-  char ap_ip_text[20];
-  char sta_ip_text[20];
-  char blackbox_file[80];
-  char blackbox_name[40];
-  char blackbox_note[80];
-  char blackbox_tail[1200];
-  char wifi_note[96];
-  char wifi_sta_note[96];
-  char wifi_sta_ssid[96];
-  char bme_note[96];
-  char meteo_summary[160];
-  char meteo_theme[64];
-  char sensor_summary[220];
-  char sensor_known[220];
-  char sensor_scan_raw[220];
-  char sensor_bosch[240];
-  char sensor_routes[220];
-  char gps_note[96];
-  char gps_sentence[112];
-  char gps_map_osm[220];
-  char gps_map_google[220];
-  char gps_map_hint[160];
-  char lora_note[96];
-  char lora_message[112];
-  char lora_history[1800];
-  formatWifiVisibleIp(ip_text, sizeof(ip_text));
-  formatWifiApIp(ap_ip_text, sizeof(ap_ip_text));
-  formatWifiStaIp(sta_ip_text, sizeof(sta_ip_text));
-  sanitizeJsonText(blackbox.file_path[0] ? blackbox.file_path : "-", blackbox_file, sizeof(blackbox_file));
-  sanitizeJsonText(baseFileName(blackbox.file_path), blackbox_name, sizeof(blackbox_name));
-  sanitizeJsonText(blackbox.note, blackbox_note, sizeof(blackbox_note));
-  formatBlackboxTailJson(blackbox_tail, sizeof(blackbox_tail));
-  sanitizeJsonText(g_wifi_diag_note, wifi_note, sizeof(wifi_note));
-  sanitizeJsonText(g_wifi_sta_note, wifi_sta_note, sizeof(wifi_sta_note));
-  sanitizeJsonText(g_wifi_sta_ssid, wifi_sta_ssid, sizeof(wifi_sta_ssid));
-  sanitizeJsonText(bme.note, bme_note, sizeof(bme_note));
-  sanitizeJsonText(gps.note, gps_note, sizeof(gps_note));
-  sanitizeJsonText(gps.last_sentence, gps_sentence, sizeof(gps_sentence));
-  sanitizeJsonText(lora.note, lora_note, sizeof(lora_note));
-  sanitizeJsonText(lora.last_message, lora_message, sizeof(lora_message));
-  formatLoraHistoryJson(lora_history, sizeof(lora_history));
-  classifyMeteoTheme(bme, meteo_theme, sizeof(meteo_theme), meteo_summary, sizeof(meteo_summary));
-  sanitizeJsonText(g_sensor_compact_cache.c_str(), sensor_summary, sizeof(sensor_summary));
-  sanitizeJsonText(g_sensor_summary_cache.c_str(), sensor_known, sizeof(sensor_known));
-  sanitizeJsonText(g_sensor_scan_compact_cache.c_str(), sensor_scan_raw, sizeof(sensor_scan_raw));
-  sanitizeJsonText(g_sensor_bosch_cache.c_str(), sensor_bosch, sizeof(sensor_bosch));
-  sanitizeJsonText(g_sensor_route_cache.c_str(), sensor_routes, sizeof(sensor_routes));
+  HttpJsonScratch &scratch = g_http_json_scratch;
+  formatWifiVisibleIp(scratch.ip_text, sizeof(scratch.ip_text));
+  formatWifiApIp(scratch.ap_ip_text, sizeof(scratch.ap_ip_text));
+  formatWifiStaIp(scratch.sta_ip_text, sizeof(scratch.sta_ip_text));
+  sanitizeJsonText(blackbox.file_path[0] ? blackbox.file_path : "-", scratch.blackbox_file, sizeof(scratch.blackbox_file));
+  sanitizeJsonText(baseFileName(blackbox.file_path), scratch.blackbox_name, sizeof(scratch.blackbox_name));
+  sanitizeJsonText(blackbox.note, scratch.blackbox_note, sizeof(scratch.blackbox_note));
+  formatBlackboxTailJson(scratch.blackbox_tail, sizeof(scratch.blackbox_tail));
+  sanitizeJsonText(g_wifi_diag_note, scratch.wifi_note, sizeof(scratch.wifi_note));
+  sanitizeJsonText(g_wifi_sta_note, scratch.wifi_sta_note, sizeof(scratch.wifi_sta_note));
+  sanitizeJsonText(g_wifi_sta_ssid, scratch.wifi_sta_ssid, sizeof(scratch.wifi_sta_ssid));
+  sanitizeJsonText(bme.note, scratch.bme_note, sizeof(scratch.bme_note));
+  sanitizeJsonText(gps.note, scratch.gps_note, sizeof(scratch.gps_note));
+  sanitizeJsonText(gps.last_sentence, scratch.gps_sentence, sizeof(scratch.gps_sentence));
+  sanitizeJsonText(gps.config_note, scratch.gps_config_note, sizeof(scratch.gps_config_note));
+  sanitizeJsonText(gps.last_command, scratch.gps_last_command, sizeof(scratch.gps_last_command));
+  formatGpsActivityJson(scratch.gps_history, sizeof(scratch.gps_history));
+  sanitizeJsonText(lora.note, scratch.lora_note, sizeof(scratch.lora_note));
+  sanitizeJsonText(lora.last_message, scratch.lora_message, sizeof(scratch.lora_message));
+  formatLoraHistoryJson(scratch.lora_history, sizeof(scratch.lora_history));
+  formatActivityHistoryJson(scratch.activity_history, sizeof(scratch.activity_history));
+  classifyMeteoTheme(bme, scratch.meteo_theme, sizeof(scratch.meteo_theme), scratch.meteo_summary, sizeof(scratch.meteo_summary));
+  sanitizeJsonText(g_sensor_compact_cache.c_str(), scratch.sensor_summary, sizeof(scratch.sensor_summary));
+  sanitizeJsonText(g_sensor_summary_cache.c_str(), scratch.sensor_known, sizeof(scratch.sensor_known));
+  sanitizeJsonText(g_sensor_scan_compact_cache.c_str(), scratch.sensor_scan_raw, sizeof(scratch.sensor_scan_raw));
+  sanitizeJsonText(g_sensor_bosch_cache.c_str(), scratch.sensor_bosch, sizeof(scratch.sensor_bosch));
+  sanitizeJsonText(g_sensor_route_cache.c_str(), scratch.sensor_routes, sizeof(scratch.sensor_routes));
+
+  const bool plane_has_altitude = gps.has_fix;
+  const bool plane_has_speed = gps.receiving || gps.has_fix;
+  const float plane_altitude_ft = plane_has_altitude ? (gps.altitude_m * 3.28084f) : 0.0f;
+  const float plane_speed_kmh = plane_has_speed ? gps.speed_kmh : 0.0f;
+  snprintf(scratch.plane_altitude_ft_text, sizeof(scratch.plane_altitude_ft_text), plane_has_altitude ? "%.1f" : "null", plane_altitude_ft);
+  snprintf(scratch.plane_speed_kmh_text, sizeof(scratch.plane_speed_kmh_text), plane_has_speed ? "%.1f" : "null", plane_speed_kmh);
 
   if (gps.has_location) {
     snprintf(
-        gps_map_osm,
-        sizeof(gps_map_osm),
+        scratch.gps_map_osm,
+        sizeof(scratch.gps_map_osm),
         "https://www.openstreetmap.org/?mlat=%.6f&mlon=%.6f#map=16/%.6f/%.6f",
         gps.latitude_deg,
         gps.longitude_deg,
         gps.latitude_deg,
         gps.longitude_deg);
     snprintf(
-        gps_map_google,
-        sizeof(gps_map_google),
+        scratch.gps_map_google,
+        sizeof(scratch.gps_map_google),
         "https://www.google.com/maps?q=%.6f,%.6f",
         gps.latitude_deg,
         gps.longitude_deg);
-    snprintf(gps_map_hint, sizeof(gps_map_hint), "Mapa pronto. Abra no celular quando houver internet na rede.");
+    snprintf(scratch.gps_map_hint, sizeof(scratch.gps_map_hint), "Mapa pronto. Abra no celular quando houver internet na rede.");
   } else if (gps.receiving) {
-    snprintf(gps_map_osm, sizeof(gps_map_osm), "");
-    snprintf(gps_map_google, sizeof(gps_map_google), "");
-    snprintf(gps_map_hint, sizeof(gps_map_hint), "GPS recebendo NMEA, mas ainda sem fix. Teste com visao aberta do ceu.");
+    snprintf(scratch.gps_map_osm, sizeof(scratch.gps_map_osm), "");
+    snprintf(scratch.gps_map_google, sizeof(scratch.gps_map_google), "");
+    snprintf(scratch.gps_map_hint, sizeof(scratch.gps_map_hint), "GPS recebendo NMEA, mas ainda sem fix. Teste com visao aberta do ceu.");
   } else {
-    snprintf(gps_map_osm, sizeof(gps_map_osm), "");
-    snprintf(gps_map_google, sizeof(gps_map_google), "");
-    snprintf(gps_map_hint, sizeof(gps_map_hint), "Sem posicao valida ainda. Confira alimentacao, TX/RX e visao do ceu.");
+    snprintf(scratch.gps_map_osm, sizeof(scratch.gps_map_osm), "");
+    snprintf(scratch.gps_map_google, sizeof(scratch.gps_map_google), "");
+    snprintf(scratch.gps_map_hint, sizeof(scratch.gps_map_hint), "Sem posicao valida ainda. Confira alimentacao, TX/RX e visao do ceu.");
   }
+  snprintf(scratch.gps_power_hint, sizeof(scratch.gps_power_hint), "GP10 modulo nu = 3V3. Breakout DX-PJ17 = VCC 5V. WAKE alto ou solto.");
+  snprintf(scratch.gps_wiring_hint, sizeof(scratch.gps_wiring_hint), "TXD GP10 -> GPIO43 | RXD GP10 -> GPIO44 | GND comum | 9600 8N1 | 1PPS opcional.");
 
   client.print(F("HTTP/1.1 200 OK\r\n"));
   client.print(F("Content-Type: application/json; charset=utf-8\r\n"));
@@ -2436,16 +2871,16 @@ static void sendHttpJsonStatus(NetworkClient &client)
       g_wifi_ap_requested ? "true" : "false",
       WIFI_AP_SSID,
       WIFI_AP_PASSWORD,
-      ap_ip_text,
+      scratch.ap_ip_text,
       g_wifi_sta_requested ? "true" : "false",
       g_wifi_sta_connected ? "true" : "false",
-      wifi_sta_ssid,
-      sta_ip_text,
-      ip_text,
+      scratch.wifi_sta_ssid,
+      scratch.sta_ip_text,
+      scratch.ip_text,
       static_cast<unsigned>(wifiClientCount()),
       static_cast<unsigned long>(g_wifi_web_hits),
-      wifi_note,
-      wifi_sta_note);
+      scratch.wifi_note,
+      scratch.wifi_sta_note);
   client.printf("\"uptime_s\":%lu,", static_cast<unsigned long>(millis() / 1000UL));
   client.printf(
       "\"touch\":{\"pressed\":%s,\"x\":%u,\"y\":%u,\"count\":%lu},",
@@ -2460,11 +2895,14 @@ static void sendHttpJsonStatus(NetworkClient &client)
       imu.pitch_deg,
       imu.roll_deg,
       imu.temperature_c);
-  client.print(F("\"plane\":{\"altitude_ft\":null,\"vario_fpm\":null,\"heading_deg\":null,\"speed_kmh\":null},"));
+  client.printf(
+      "\"plane\":{\"altitude_ft\":%s,\"vario_fpm\":null,\"heading_deg\":null,\"speed_kmh\":%s},",
+      scratch.plane_altitude_ft_text,
+      scratch.plane_speed_kmh_text);
   client.printf(
       "\"meteo\":{\"theme\":\"%s\",\"summary\":\"%s\",\"connected\":%s,\"has_data\":%s,\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"altitude_m\":%.1f,\"gas_ohms\":%.0f,\"last_update_ms\":%lu,\"note\":\"%s\"},",
-      meteo_theme,
-      meteo_summary,
+      scratch.meteo_theme,
+      scratch.meteo_summary,
       bme.connected ? "true" : "false",
       bme.has_data ? "true" : "false",
       bme.temperature_c,
@@ -2473,9 +2911,9 @@ static void sendHttpJsonStatus(NetworkClient &client)
       bme.altitude_m,
       bme.gas_ohms,
       static_cast<unsigned long>(bme.last_update_ms),
-      bme_note);
+      scratch.bme_note);
   client.printf(
-      "\"gps\":{\"uart_ready\":%s,\"receiving\":%s,\"fix\":%s,\"has_location\":%s,\"sats\":%u,\"rx_bytes\":%lu,\"line_count\":%lu,\"last_rx_ms\":%lu,\"last_fix_ms\":%lu,\"lat\":%.6f,\"lon\":%.6f,\"alt_m\":%.1f,\"speed_kmh\":%.1f,\"last_sentence\":\"%s\",\"note\":\"%s\",\"map_osm\":\"%s\",\"map_google\":\"%s\",\"map_hint\":\"%s\"},",
+      "\"gps\":{\"uart_ready\":%s,\"receiving\":%s,\"fix\":%s,\"has_location\":%s,\"sats\":%u,\"rx_bytes\":%lu,\"line_count\":%lu,\"last_rx_ms\":%lu,\"last_fix_ms\":%lu,\"lat\":%.6f,\"lon\":%.6f,\"alt_m\":%.1f,\"speed_kmh\":%.1f,\"update_hz\":%u,\"last_sentence\":\"%s\",\"note\":\"%s\",\"config_note\":\"%s\",\"last_command\":\"%s\",\"power_hint\":\"%s\",\"wiring_hint\":\"%s\",\"map_osm\":\"%s\",\"map_google\":\"%s\",\"map_hint\":\"%s\",\"history\":\"%s\"},",
       gps.uart_ready ? "true" : "false",
       gps.receiving ? "true" : "false",
       gps.has_fix ? "true" : "false",
@@ -2489,11 +2927,17 @@ static void sendHttpJsonStatus(NetworkClient &client)
       gps.longitude_deg,
       gps.altitude_m,
       gps.speed_kmh,
-      gps_sentence,
-      gps_note,
-      gps_map_osm,
-      gps_map_google,
-      gps_map_hint);
+      static_cast<unsigned>(gps.update_rate_hz),
+      scratch.gps_sentence,
+      scratch.gps_note,
+      scratch.gps_config_note,
+      scratch.gps_last_command,
+      scratch.gps_power_hint,
+      scratch.gps_wiring_hint,
+      scratch.gps_map_osm,
+      scratch.gps_map_google,
+      scratch.gps_map_hint,
+      scratch.gps_history);
   client.printf(
       "\"lora\":{\"enabled\":%s,\"uart_ready\":%s,\"aux_high\":%s,\"receiving\":%s,\"rx_bytes\":%lu,\"tx_bytes\":%lu,\"last_rx_ms\":%lu,\"last_tx_ms\":%lu,\"last_message\":\"%s\",\"note\":\"%s\",\"history\":\"%s\",\"console_note\":\"Console de payload UART LoRa. Nao e analisador SDR/RF.\"},",
       lora.enabled ? "true" : "false",
@@ -2504,9 +2948,10 @@ static void sendHttpJsonStatus(NetworkClient &client)
       static_cast<unsigned long>(lora.tx_bytes),
       static_cast<unsigned long>(lora.last_rx_ms),
       static_cast<unsigned long>(lora.last_tx_ms),
-      lora_message,
-      lora_note,
-      lora_history);
+      scratch.lora_message,
+      scratch.lora_note,
+      scratch.lora_history);
+  client.printf("\"activity\":{\"recent\":\"%s\"},", scratch.activity_history);
   client.printf(
       "\"comms\":{\"lora_enabled\":%s,\"lora_uart_ready\":%s,\"gps_fix\":%s,\"gps_uart_ready\":%s,\"gps_receiving\":%s},",
       g_lora_enabled ? "true" : "false",
@@ -2528,21 +2973,21 @@ static void sendHttpJsonStatus(NetworkClient &client)
       static_cast<unsigned long>(blackbox.records_written),
       static_cast<unsigned long>(blackbox.last_log_ms),
       static_cast<unsigned long long>(blackbox.card_size_bytes),
-      blackbox_file,
-      blackbox_name,
-      blackbox_note,
-      blackbox_tail);
+      scratch.blackbox_file,
+      scratch.blackbox_name,
+      scratch.blackbox_note,
+      scratch.blackbox_tail);
   client.printf(
       "\"ui\":{\"rotation\":\"%s\",\"orientation\":\"%s\"},",
       rotationLabel(g_display_rotation),
       orientationModeLabel(g_orientation_mode));
   client.printf(
       "\"sensors\":{\"summary\":\"%s\",\"known\":\"%s\",\"scan\":\"%s\",\"bosch\":\"%s\",\"routes\":\"%s\"}}\n",
-      sensor_summary,
-      sensor_known,
-      sensor_scan_raw,
-      sensor_bosch,
-      sensor_routes);
+      scratch.sensor_summary,
+      scratch.sensor_known,
+      scratch.sensor_scan_raw,
+      scratch.sensor_bosch,
+      scratch.sensor_routes);
 }
 
 static void sendHttpDashboard(NetworkClient &client)
@@ -2567,6 +3012,11 @@ static void sendHttpDashboard(NetworkClient &client)
 .tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}
 .section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.muted{color:var(--muted);font-size:14px;line-height:1.55}.mono{font-family:Consolas,monospace}
 .footer{margin-top:14px;color:var(--muted);font-size:12px;transition:color .18s ease,opacity .18s ease}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;border:1px solid #275779;background:#123046;color:#dff6ff;font-size:12px;font-weight:700}
+.pill.ok{border-color:#2f7b5a;background:#10281d;color:#d8ffe9}
+.pill.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}
+.pill.off{border-color:#5a3030;background:#281313;color:#ffd8d8}
 input{width:100%;background:#08131d;border:1px solid #21445f;border-radius:10px;color:#eef6ff;padding:10px 12px;margin-top:8px}
 pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:Consolas,monospace;background:#08131d;border:1px solid #1d3245;border-radius:12px;padding:12px;min-height:150px;color:#d7edf7}
 </style></head><body><div class='wrap'>
@@ -2575,7 +3025,7 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:Consolas,mon
 <div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div>
 <div class='mini'><b>LAN local</b><span id='heroLan'>--</span></div>
 <div class='mini'><b>URL principal</b><span class='mono' id='heroUrl'>--</span></div>
-<div class='mini'><b>Modo / tela</b><span id='heroMode'>--</span></div>
+<div class='mini'><b>Estado da web</b><span id='heroMode'>--</span></div>
 </div>
 <div class='actions'>
 <button class='btn alt' onclick="act('wifi=toggle')">AP on/off</button>
@@ -2596,13 +3046,17 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:Consolas,mon
   client.print(F(R"SBWEB(
 <section class='section active' id='section-lab'><div class='split'>
 <div class='card'><h3>BME688</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Endereco: <span class='mono' id='labBmeAddr'>--</span><br>Temp: <span id='labBmeTemp'>--</span><br>Umidade: <span id='labBmeHum'>--</span><br>Pressao: <span id='labBmePress'>--</span><br>Altitude: <span id='labBmeAlt'>--</span><br>Gas: <span id='labBmeGas'>--</span><br>Nariz digital: <span id='labBmeGasMode'>--</span><br>Nota: <span id='labBmeNote'>--</span></div></div>
-<div class='card'><h3>GPS</h3><div class='big' id='labGpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44</span><br>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Alt/Vel: <span id='labGpsMotion'>--</span><br>Ultima NMEA: <span class='mono' id='labGpsSentence'>--</span></div></div>
+<div class='card'><h3>GPS</h3><div class='big' id='labGpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44 @ 9600</span><br>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Alt/Vel: <span id='labGpsMotion'>--</span><br>Ultima NMEA: <span class='mono' id='labGpsSentence'>--</span><br>Cfg: <span id='labGpsCfg'>--</span></div></div>
 <div class='card'><h3>LoRa UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>Pinos: <span class='mono'>TX17 RX18 AUX6 M0/1 7/8</span><br>AUX: <span id='labLoraAux'>--</span><br>RX/TX bytes: <span id='labLoraTraffic'>--</span><br>Ultima msg: <span class='mono' id='labLoraMsg'>--</span><br>Nota: <span id='labLoraNote'>--</span></div><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button><button class='btn small' onclick="setTab('lora')">Abrir console LoRa</button></div></div>
+<div class='card'><h3>UART Monitor</h3><div class='muted'>Status rapido para descobrir se cada barramento esta vivo antes de investigar fix ou payload.</div><div class='pills'><span class='pill off' id='uartGpsUart'>GPS UART OFF</span><span class='pill off' id='uartGpsRx'>GPS RX OFF</span><span class='pill off' id='uartGpsFix'>GPS FIX OFF</span><span class='pill off' id='uartLoraUart'>LoRa UART OFF</span><span class='pill off' id='uartLoraRx'>LoRa RX OFF</span><span class='pill off' id='uartLoraTx'>LoRa TX OFF</span></div><div class='footer' id='uartHint'>Aguardando diagnostico...</div></div>
 </div></section>
 <section class='section' id='section-gps'><div class='split'>
-<div class='card'><h3>Status GPS</h3><div class='big' id='gpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44 @ 9600</span><br>Fix: <span id='gpsFix'>--</span><br>Satelites: <span id='gpsSats'>--</span><br>Recebendo: <span id='gpsReceiving'>--</span><br>Bytes RX: <span id='gpsBytes'>--</span><br>Linhas NMEA: <span id='gpsLines'>--</span><br>Ultimo RX: <span id='gpsLastRx'>--</span><br>Ultimo fix: <span id='gpsLastFix'>--</span></div></div>
-<div class='card'><h3>Posicao</h3><div class='big' id='gpsLatLon'>--</div><div class='muted'>Altitude: <span id='gpsAlt'>--</span><br>Velocidade: <span id='gpsSpeed'>--</span><br>Nota: <span id='gpsNote'>--</span></div></div>
+<div class='card'><h3>Status GPS</h3><div class='big' id='gpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44 @ 9600</span><br>Fix: <span id='gpsFix'>--</span><br>Satelites: <span id='gpsSats'>--</span><br>Recebendo: <span id='gpsReceiving'>--</span><br>Bytes RX: <span id='gpsBytes'>--</span><br>Linhas NMEA: <span id='gpsLines'>--</span><br>Ultimo RX: <span id='gpsLastRx'>--</span><br>Ultimo fix: <span id='gpsLastFix'>--</span><br>Update rate: <span id='gpsRate'>--</span><br>Ultimo cmd: <span class='mono' id='gpsLastCmd'>--</span></div></div>
+<div class='card'><h3>Posicao</h3><div class='big' id='gpsLatLon'>--</div><div class='muted'>Altitude: <span id='gpsAlt'>--</span><br>Velocidade: <span id='gpsSpeed'>--</span><br>Nota: <span id='gpsNote'>--</span><br>Config: <span id='gpsCfg'>--</span></div></div>
 <div class='card'><h3>Mapa</h3><div class='muted'>Abra o mapa no celular quando houver coordenadas validas.<br>Dica: o AP puro pode deixar o celular sem internet; em `LAN` o mapa tende a funcionar melhor.</div><div class='actions'><a class='btn small' id='gpsOsmLink' href='#' target='_blank' rel='noopener noreferrer'>OpenStreetMap</a><a class='btn small' id='gpsGoogleLink' href='#' target='_blank' rel='noopener noreferrer'>Google Maps</a></div><div class='footer' id='gpsMapHint'>--</div></div>
+<div class='card'><h3>Diagnostico GP10</h3><div class='muted'>Alimentacao: <span id='gpsPowerHint'>--</span><br>Ligacao: <span class='mono' id='gpsWiringHint'>--</span><br>Busca de satelites: use area aberta, sem teto, motores ou fontes proximas.<br>1PPS: depois do fix, o LED/PPS deve pulsar 1 vez por segundo.</div></div>
+<div class='card'><h3>Controles GP10</h3><div class='muted'>Use estes comandos para bancada e recuperacao rapida do GPS.</div><div class='actions'><button class='btn small' onclick="act('gps_restart=cold')">Cold Start</button><button class='btn small' onclick="act('gps_restart=hot')">Hot Start</button><button class='btn small' onclick="act('gps_rate=1')">1Hz</button><button class='btn small' onclick="act('gps_rate=5')">5Hz</button><button class='btn small' onclick="act('gps_constellation=all')">All GNSS</button><button class='btn small' onclick="act('gps_constellation=gps_bds')">GPS+BDS</button><button class='btn small' onclick="act('gps_nmea=all_on')">All NMEA ON</button></div></div>
+<div class='card'><h3>Atividade recente GPS</h3><pre id='gpsHistory'>--</pre></div>
 <div class='card'><h3>Ultima NMEA</h3><pre id='gpsSentence'>--</pre></div>
 </div></section>
 <section class='section' id='section-sd'><div class='split'>
@@ -2623,13 +3077,14 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:Consolas,mon
 </div></section>)SBWEB"));
   client.print(F(R"SBWEB(
 <section class='section' id='section-lora'><div class='split'><div class='card'><h3>Estado LoRa</h3><div class='big' id='lrState'>--</div><div class='muted'>UART: <span class='mono'>TX17 RX18 | AUX6 | M0/1 7/8</span><br>AUX: <span id='lrAux'>--</span><br>RX bytes: <span id='lrRx'>--</span><br>TX bytes: <span id='lrTx'>--</span><br>Ultimo RX: <span id='lrLastRx'>--</span><br>Ultimo TX: <span id='lrLastTx'>--</span><br>Ultima msg: <span class='mono' id='lrMsg'>--</span><br>Nota: <span id='lrPlan'>--</span></div><div class='footer' id='lrConsoleHint'>--</div></div><div class='card'><h3>Console LoRa</h3><div class='muted'>Mostra o trafego de payload/UART do modulo LoRa. Nao mostra espectro RF bruto como SDR. Destino atual: outro modulo LoRa remoto com a mesma configuracao, nao um servidor web automatico.</div><input id='lrPayload' type='text' placeholder='Ex: TEMP=27.5,PRESS=1008.2'><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button><button class='btn small' onclick="sendLoraPayload()">Enviar payload</button><button class='btn small' onclick="act('lora_tx=ping')">PING</button><button class='btn small' onclick="act('lora_tx=status')">STATUS?</button><button class='btn small' onclick="act('lora_tx=meteo')">Enviar METEO</button><button class='btn small' onclick="act('lora_tx=gps')">Enviar GPS</button><button class='btn small' onclick="act('lora_clear=1')">Limpar console</button></div><pre id='lrConsole'>--</pre></div></div></section>
-<section class='section' id='section-config'><div class='split'><div class='card'><h3>Config</h3><div class='muted'>Tela ativa: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Orientacao: <span id='cfOrientation'>--</span><br>Rotacao: <span id='cfRotation'>--</span><br>Logger: <span id='cfLogger'>--</span><br>Ultima escrita: <span id='cfLastLog'>--</span></div></div><div class='card'><h3>SD e sensores</h3><div class='muted'>Arquivo: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Nota SD: <span id='cfNote'>--</span><br>Sensores: <span id='cfSensors'>--</span><br>Scan I2C: <span class='mono' id='cfScan'>--</span></div></div></div></section>
-<section class='section' id='section-overview'><div class='grid'><div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes AP: <span id='ovClients'>--</span></div></div><div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div><div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div><div class='card'><h3>Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div></div></section>
+<section class='section' id='section-config'><div class='split'><div class='card'><h3>Config</h3><div class='muted'>Tela do dispositivo: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Orientacao: <span id='cfOrientation'>--</span><br>Rotacao: <span id='cfRotation'>--</span><br>Logger: <span id='cfLogger'>--</span><br>Ultima escrita: <span id='cfLastLog'>--</span></div></div><div class='card'><h3>SD e sensores</h3><div class='muted'>Arquivo: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Nota SD: <span id='cfNote'>--</span><br>Sensores: <span id='cfSensors'>--</span><br>Scan I2C: <span class='mono' id='cfScan'>--</span></div></div></div></section>
+<section class='section' id='section-overview'><div class='grid'><div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes AP: <span id='ovClients'>--</span></div></div><div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div><div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div><div class='card'><h3>Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div><div class='card'><h3>Atividade recente</h3><pre id='ovActivity'>--</pre></div></div></section>
 <script>
 const $=i=>document.getElementById(i), txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v, toText=v=>String(txt(v));
 const put=(i,v)=>{const e=$(i); if(!e)return; const next=toText(v); if(e.textContent!==next)e.textContent=next;};
 const val=(i,v)=>{const e=$(i); const next=v||''; if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
 const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
+function setPill(id,label,state){const e=$(id); if(!e)return; const next=toText(label); if(e.textContent!==next)e.textContent=next; const cls='pill '+(state||'off'); if(e.className!==cls)e.className=cls;}
 function linkify(id,href,label){const e=$(id); if(!e)return; const enabled=!!(href&&href!==''&&href!=='--'); const nextHref=enabled?href:'#'; const nextLabel=enabled?(label||href):(label||'Indisponivel'); const nextOpacity=enabled?'1':'.5'; const nextPointer=enabled?'auto':'none'; if(e.href!==nextHref)e.href=nextHref; if(e.textContent!==nextLabel)e.textContent=nextLabel; if(e.style.pointerEvents!==nextPointer)e.style.pointerEvents=nextPointer; if(e.style.opacity!==nextOpacity)e.style.opacity=nextOpacity;}
 function setTab(n){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}
 let refreshBusy=false,lastRefreshAt=0,refreshTimer=null;
@@ -2639,18 +3094,21 @@ function fmtMs(v){return(v===undefined||v===null||v===0)?'--':String(v)+' ms';} 
 function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){alert('Digite o SSID da rede local.'); return;} act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on',1200);}
 function sendLoraPayload(){const payload=$('lrPayload').value.trim(); if(!payload){alert('Digite um payload para enviar no LoRa.'); return;} act('lora_payload='+encodeURIComponent(payload),500);}
 ['cmStaSsid','cmStaPass'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>e.dataset.user='1');});
-function refresh(force=false){const now=Date.now(); if(refreshBusy)return; if(!force&&now-lastRefreshAt<1800)return; refreshBusy=true; fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{put('heroAp',yes(d.wifi.ap,'AP ativo','AP offline')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?('Conectando em '+txt(d.wifi.sta_ssid,'--')):'LAN desligada')); put('heroUrl',fmtUrl(d.wifi.ip)); put('heroMode',txt(d.wifi.mode)+' | '+txt(d.screen_label));
+function refresh(force=false){const now=Date.now(); if(refreshBusy)return; if(!force&&now-lastRefreshAt<3200)return; refreshBusy=true; fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{const webState=(d.wifi.ap?'AP estavel':'AP offline')+(d.wifi.sta_connected?' | LAN OK':'')+(d.runtime_light?' | modo leve':' | modo normal'); put('heroAp',yes(d.wifi.ap,'AP ativo','AP offline')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?('Conectando em '+txt(d.wifi.sta_ssid,'--')):'LAN desligada')); put('heroUrl',fmtUrl(d.wifi.ip)); put('heroMode',webState);
 put('labBmeState',d.meteo.connected?(d.meteo.has_data?'BME lendo':'BME detectado'):'BME OFF'); put('labBmeAddr',d.sensors.scan.includes('0x77')?'0x77':(d.sensors.scan.includes('0x76')?'0x76':'--')); put('labBmeTemp',num(d.meteo.temperature_c,' C')); put('labBmeHum',num(d.meteo.humidity_pct,' %')); put('labBmePress',num(d.meteo.pressure_hpa,' hPa')); put('labBmeAlt',num(d.meteo.altitude_m,' m')); put('labBmeGas',num(d.meteo.gas_ohms,' ohms')); put('labBmeGasMode',d.meteo.has_data?'Gas bruto OK | IA futura':'Aguardando leitura'); put('labBmeNote',txt(d.meteo.note));
-put('labGpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'NMEA RX':'GPS aguardando')); put('labGpsFix',d.gps.fix?('OK / '+txt(d.gps.sats)+' sats'):'sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsMotion',num(d.gps.alt_m,' m')+' / '+num(d.gps.speed_kmh,' km/h')); put('labGpsSentence',txt(d.gps.last_sentence));
+put('labGpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'NMEA RX':'GPS aguardando')); put('labGpsFix',d.gps.fix?('OK / '+txt(d.gps.sats)+' sats'):'sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsMotion',num(d.gps.alt_m,' m')+' / '+num(d.gps.speed_kmh,' km/h')); put('labGpsSentence',txt(d.gps.last_sentence)); put('labGpsCfg',txt(d.gps.config_note));
 put('labLoraState',d.lora.enabled?(d.lora.receiving?'RX ativo':'LoRa ON'):'LoRa OFF'); put('labLoraAux',yes(d.lora.aux_high,'HIGH','LOW')); put('labLoraTraffic',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes)); put('labLoraMsg',txt(d.lora.last_message)); put('labLoraNote',txt(d.lora.note));
-put('gpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'recebendo NMEA':'aguardando')); put('gpsFix',yes(d.gps.fix,'fix valido','sem fix')); put('gpsSats',txt(d.gps.sats)); put('gpsReceiving',yes(d.gps.receiving,'sim','nao')); put('gpsBytes',txt(d.gps.rx_bytes)); put('gpsLines',txt(d.gps.line_count)); put('gpsLastRx',fmtMs(d.gps.last_rx_ms)); put('gpsLastFix',fmtMs(d.gps.last_fix_ms)); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsNote',txt(d.gps.note)); put('gpsSentence',txt(d.gps.last_sentence)); put('gpsMapHint',txt(d.gps.map_hint)); linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps');
+const gpsRxOk=!!(d.gps.receiving||d.gps.rx_bytes>0||d.gps.line_count>0), gpsFixOk=!!(d.gps.fix&&d.gps.has_location), loraRxOk=!!(d.lora.receiving||d.lora.rx_bytes>0), loraTxOk=!!(d.lora.tx_bytes>0), loraUartOk=!!d.lora.uart_ready;
+setPill('uartGpsUart',d.gps.uart_ready?'GPS UART OK':'GPS UART OFF',d.gps.uart_ready?'ok':'off'); setPill('uartGpsRx',gpsRxOk?'GPS RX OK':'GPS RX OFF',gpsRxOk?'ok':'off'); setPill('uartGpsFix',gpsFixOk?'GPS FIX OK':'GPS FIX OFF',gpsFixOk?'ok':(gpsRxOk?'warn':'off')); setPill('uartLoraUart',loraUartOk?'LoRa UART OK':'LoRa UART OFF',loraUartOk?'ok':'off'); setPill('uartLoraRx',loraRxOk?'LoRa RX OK':'LoRa RX OFF',loraRxOk?'ok':(d.lora.enabled?'warn':'off')); setPill('uartLoraTx',loraTxOk?'LoRa TX OK':'LoRa TX OFF',loraTxOk?'ok':(d.lora.enabled?'warn':'off'));
+put('uartHint',gpsFixOk?'GPS com coordenadas validas; mapa pronto para habilitar.':(gpsRxOk?'GPS com NMEA, mas ainda sem fix. Teste ao ar livre.':(d.gps.uart_ready?'GPS sem bytes NMEA. Revisar VCC/TXD/RXD/WAKE.':(loraUartOk?(loraRxOk||loraTxOk?'LoRa UART viva com trafego detectado.':'LoRa UART pronta, mas sem trafego real ainda.'):txt(d.lora.note,'Aguardando diagnostico UART.')))));
+put('gpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'recebendo NMEA':'aguardando')); put('gpsFix',yes(d.gps.fix,'fix valido','sem fix')); put('gpsSats',txt(d.gps.sats)); put('gpsReceiving',yes(d.gps.receiving,'sim','nao')); put('gpsBytes',txt(d.gps.rx_bytes)); put('gpsLines',txt(d.gps.line_count)); put('gpsLastRx',fmtMs(d.gps.last_rx_ms)); put('gpsLastFix',fmtMs(d.gps.last_fix_ms)); put('gpsRate',txt(d.gps.update_hz?d.gps.update_hz+' Hz':'1 Hz')); put('gpsLastCmd',txt(d.gps.last_command)); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsNote',txt(d.gps.note)); put('gpsCfg',txt(d.gps.config_note)); put('gpsSentence',txt(d.gps.last_sentence)); put('gpsPowerHint',txt(d.gps.power_hint)); put('gpsWiringHint',txt(d.gps.wiring_hint)); put('gpsMapHint',txt(d.gps.map_hint)); put('gpsHistory',txt(d.gps.history).replaceAll('\\n','\n')); linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps');
 put('sdState',yes(d.blackbox.mounted,'montado','sem cartao')); put('sdSize',fmtBytes(d.blackbox.card_size_bytes)); put('sdLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('sdFile',txt(d.blackbox.file)); put('sdName',txt(d.blackbox.file_name)); put('sdRecords',txt(d.blackbox.records)); put('sdLast',fmtMs(d.blackbox.last_log_ms)); put('sdNote',txt(d.blackbox.note)); put('sdTail',txt(d.blackbox.tail).replaceAll('\\n','\n'));
 put('mtTheme',txt(d.meteo.theme)); put('mtSummary',txt(d.meteo.summary)); put('mtTemp',num(d.meteo.temperature_c,' C')); put('mtHum',num(d.meteo.humidity_pct,' %')); put('mtPress',num(d.meteo.pressure_hpa,' hPa')); put('mtAlt',num(d.meteo.altitude_m,' m')); put('mtGas',num(d.meteo.gas_ohms,' ohms'));
 put('cmMode',txt(d.wifi.mode)); put('cmApUrl',fmtUrl(d.wifi.ap_ip)); put('cmStaUrl',d.wifi.sta_connected?fmtUrl(d.wifi.sta_ip):'--'); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); put('cmNote',txt(d.wifi.note)); put('cmStaNote',txt(d.wifi.sta_note)); put('cmSensors',txt(d.sensors.summary)); put('cmRoutes',txt(d.sensors.routes)); put('cmScan',txt(d.sensors.scan)); val('cmStaSsid',txt(d.wifi.sta_ssid,''));
 put('lrState',yes(d.lora.enabled,'ligado','desligado')); put('lrAux',yes(d.lora.aux_high,'HIGH','LOW')); put('lrRx',txt(d.lora.rx_bytes)); put('lrTx',txt(d.lora.tx_bytes)); put('lrLastRx',fmtMs(d.lora.last_rx_ms)); put('lrLastTx',fmtMs(d.lora.last_tx_ms)); put('lrMsg',txt(d.lora.last_message)); put('lrPlan',txt(d.lora.note)); put('lrConsole',txt(d.lora.history).replaceAll('\\n','\n')); put('lrConsoleHint',txt(d.lora.console_note));
 put('cfScreen',txt(d.screen_label)); put('cfMode',d.runtime_light?'leve':'normal'); put('cfOrientation',txt(d.ui.orientation)); put('cfRotation',txt(d.ui.rotation)); put('cfLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('cfLastLog',fmtMs(d.blackbox.last_log_ms)); put('cfFile',txt(d.blackbox.file)); put('cfRecords',txt(d.blackbox.records)); put('cfNote',txt(d.blackbox.note)); put('cfSensors',txt(d.sensors.known)); put('cfScan',txt(d.sensors.scan));
-put('ovUptime',num(d.uptime_s,' s')); put('ovHits',txt(d.wifi.web_hits)); put('ovClients',txt(d.wifi.clients)); put('ovImu',d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF'); put('ovPitch',num(d.imu.pitch_deg,' deg')); put('ovRoll',num(d.imu.roll_deg,' deg')); put('ovTemp',num(d.imu.temperature_c,' C')); put('ovTouch',yes(d.touch.pressed,'ON','OFF')); put('ovTouchXY',txt(d.touch.x)+','+txt(d.touch.y)); put('ovTouchCount',txt(d.touch.count)); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records)); lastRefreshAt=Date.now();}).catch(()=>{}).finally(()=>{refreshBusy=false;});}
-setTab('lab'); refresh(true); setInterval(()=>refresh(false),2600);
+put('ovUptime',num(d.uptime_s,' s')); put('ovHits',txt(d.wifi.web_hits)); put('ovClients',txt(d.wifi.clients)); put('ovImu',d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF'); put('ovPitch',num(d.imu.pitch_deg,' deg')); put('ovRoll',num(d.imu.roll_deg,' deg')); put('ovTemp',num(d.imu.temperature_c,' C')); put('ovTouch',yes(d.touch.pressed,'ON','OFF')); put('ovTouchXY',txt(d.touch.x)+','+txt(d.touch.y)); put('ovTouchCount',txt(d.touch.count)); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records)); put('ovActivity',txt(d.activity.recent).replaceAll('\\n','\n')); lastRefreshAt=Date.now();}).catch(()=>{}).finally(()=>{refreshBusy=false;});}
+setTab('lab'); refresh(true); setInterval(()=>refresh(false),4000);
 </script></div></body></html>)SBWEB"));
   return;
   client.print(F("HTTP/1.1 200 OK\r\n"));
@@ -2730,6 +3188,12 @@ static void handleWifiPortal()
     client.stop();
     return;
   }
+
+  Serial.printf(
+      "[WEB] Cliente %u | path=%s | heap=%lu\n",
+      static_cast<unsigned>(wifiClientCount()),
+      request_path,
+      static_cast<unsigned long>(ESP.getFreeHeap()));
 
   if (strncmp(request_path, "/api/action", 11) == 0) {
     handleHttpActionPath(request_path);
@@ -3190,6 +3654,7 @@ static bool mountBlackboxStorage(BlackboxState *state)
       sizeof(state->note),
       "Cartao %s montado. Pronto para gravar",
       cardTypeLabel(card_type));
+  appendActivityLine("SD", "cartao montado");
   return true;
 }
 
@@ -3226,6 +3691,7 @@ static bool openBlackboxLog(BlackboxState *state)
   state->records_written = 0;
   clearBlackboxTail();
   snprintf(state->note, sizeof(state->note), "Gravando IMU, GPS e BME688 para bancada.");
+  appendActivityLine("SD", baseFileName(path));
   return true;
 }
 
@@ -3887,11 +4353,14 @@ static void blackboxTask(void *parameter)
       storeBlackboxState(state);
     }
 
-    if (!state.mounted && state.logging_enabled && (now - last_mount_attempt_ms) >= BLACKBOX_MOUNT_RETRY_MS) {
+    if (!state.mounted && (now - last_mount_attempt_ms) >= BLACKBOX_MOUNT_RETRY_MS) {
       last_mount_attempt_ms = now;
 
       if (mountBlackboxStorage(&state)) {
         Serial.println("[BLACKBOX] Cartao SD montado");
+        if (!state.logging_enabled) {
+          snprintf(state.note, sizeof(state.note), "SD montado. Logger pausado pelo modo atual");
+        }
       }
 
       storeBlackboxState(state);
@@ -5511,6 +5980,7 @@ static void refreshEfisUI()
   }
 
   const ImuState imu = copyImuState();
+  const GpsState gps = copyGpsState();
   const bool bmp_ok = scanHasAddress(g_sensor_raw_scan_cache, 0x47) || scanHasAddress(g_sensor_raw_scan_cache, 0x46);
   const bool bmm_ok = scanHasAddress(g_sensor_raw_scan_cache, 0x14);
   ImuState display_imu = imu;
@@ -5563,11 +6033,14 @@ static void refreshEfisUI()
   }
 
   if (g_lbl_plane_speed) {
-    lv_label_set_text(g_lbl_plane_speed, "-- km/h");
+    if (gps.receiving || gps.has_fix) {
+      lv_label_set_text_fmt(g_lbl_plane_speed, "%.1f km/h", gps.speed_kmh);
+    } else {
+      lv_label_set_text(g_lbl_plane_speed, "-- km/h");
+    }
   }
 
   if (g_lbl_plane_skydive) {
-    const GpsState gps = copyGpsState();
     lv_label_set_text_fmt(
         g_lbl_plane_skydive,
         "BMP581 %s | BMM350 %s | GPS %s",
@@ -5616,6 +6089,11 @@ static void refreshEfisUI()
 
 static void refreshConfigUI()
 {
+  const bool screen_home = g_current_screen_id == SCREEN_HOME;
+  const bool screen_meteo = g_current_screen_id == SCREEN_METEO;
+  const bool screen_comms = g_current_screen_id == SCREEN_GPS;
+  const bool screen_lora = g_current_screen_id == SCREEN_LORA;
+  const bool screen_config = g_current_screen_id == SCREEN_CONFIG;
   const BlackboxState blackbox = copyBlackboxState();
   char ip_text[20];
   char ap_ip_text[20];
@@ -5628,19 +6106,19 @@ static void refreshConfigUI()
     g_sd_purge_armed = false;
   }
 
-  if (g_lbl_config_orientation) {
+  if (screen_config && g_lbl_config_orientation) {
     lv_label_set_text_fmt(g_lbl_config_orientation, "Modo: %s", orientationModeLabel(g_orientation_mode));
   }
 
-  if (g_lbl_config_rotation) {
+  if (screen_config && g_lbl_config_rotation) {
     lv_label_set_text_fmt(g_lbl_config_rotation, "Ativa: %s", rotationLabel(g_display_rotation));
   }
 
-  if (g_lbl_config_brightness) {
+  if (screen_config && g_lbl_config_brightness) {
     lv_label_set_text_fmt(g_lbl_config_brightness, "Brilho: %u / 255", static_cast<unsigned>(g_display_brightness));
   }
 
-  if (g_lbl_config_cdc) {
+  if (screen_config && g_lbl_config_cdc) {
     const GpsState gps = copyGpsState();
     lv_label_set_text_fmt(
         g_lbl_config_cdc,
@@ -5651,7 +6129,7 @@ static void refreshConfigUI()
         gps.receiving ? "RX" : "--");
   }
 
-  if (g_lbl_config_net) {
+  if (screen_config && g_lbl_config_net) {
     char net_text[320];
     if (isLandscapeUI()) {
       snprintf(
@@ -5682,11 +6160,11 @@ static void refreshConfigUI()
     lv_label_set_text(g_lbl_config_net, net_text);
   }
 
-  if (g_lbl_config_sensors) {
+  if (screen_config && g_lbl_config_sensors) {
     lv_label_set_text(g_lbl_config_sensors, g_sensor_route_cache.c_str());
   }
 
-  if (g_lbl_config_note) {
+  if (screen_config && g_lbl_config_note) {
     char note_text[128];
     if (g_sd_purge_armed) {
       const uint32_t remaining_ms = SD_PURGE_CONFIRM_MS - (millis() - g_sd_purge_arm_ms);
@@ -5704,7 +6182,7 @@ static void refreshConfigUI()
     lv_label_set_text(g_lbl_config_note, note_text);
   }
 
-  if (g_lbl_config_blackbox) {
+  if (screen_config && g_lbl_config_blackbox) {
     char size_text[24];
     char status_text[192];
 
@@ -5722,29 +6200,29 @@ static void refreshConfigUI()
     lv_label_set_text(g_lbl_config_blackbox, status_text);
   }
 
-  if (g_lbl_config_scan_raw) {
+  if (screen_config && g_lbl_config_scan_raw) {
     lv_label_set_text_fmt(g_lbl_config_scan_raw, "I2C %s", g_sensor_scan_compact_cache.c_str());
   }
 
-  if (g_lbl_config_blackbox_btn) {
+  if (screen_config && g_lbl_config_blackbox_btn) {
     lv_label_set_text(
         g_lbl_config_blackbox_btn,
         blackbox.logging_enabled ? "Pausar" : "Ligar");
   }
 
-  if (g_lbl_config_format_btn) {
+  if (screen_config && g_lbl_config_format_btn) {
     lv_label_set_text(g_lbl_config_format_btn, "Limpar SD");
   }
 
-  if (g_lbl_config_wifi_btn) {
+  if (screen_config && g_lbl_config_wifi_btn) {
     lv_label_set_text(g_lbl_config_wifi_btn, g_wifi_ap_requested ? "Desligar AP" : "Ligar AP");
   }
 
-  if (g_lbl_config_lora_btn) {
+  if (screen_config && g_lbl_config_lora_btn) {
     lv_label_set_text(g_lbl_config_lora_btn, g_lora_enabled ? "Desligar LoRa" : "Ligar LoRa");
   }
 
-  if (g_lbl_home_hint) {
+  if (screen_home && g_lbl_home_hint) {
     char home_text[160];
     snprintf(
         home_text,
@@ -5758,7 +6236,7 @@ static void refreshConfigUI()
     lv_label_set_text(g_lbl_home_hint, home_text);
   }
 
-  if (g_lbl_meteo_theme) {
+  if (screen_meteo && g_lbl_meteo_theme) {
     const Bme688State bme_weather = copyBme688State();
     char meteo_theme[48];
     char meteo_summary[160];
@@ -5841,7 +6319,7 @@ static void refreshConfigUI()
     }
   }
 
-  {
+  if (screen_meteo) {
     const Bme688State bme = copyBme688State();
     if (g_lbl_meteo_altitude) {
       if (bme.has_data) {
@@ -5873,7 +6351,7 @@ static void refreshConfigUI()
     }
   }
 
-  if (g_lbl_comms_wifi) {
+  if (screen_comms && g_lbl_comms_wifi) {
     char wifi_text[220];
     if (isLandscapeUI()) {
       snprintf(
@@ -5899,13 +6377,13 @@ static void refreshConfigUI()
     lv_label_set_text(g_lbl_comms_wifi, wifi_text);
   }
 
-  if (g_lbl_comms_mode) {
+  if (screen_comms && g_lbl_comms_mode) {
     lv_label_set_text(
         g_lbl_comms_mode,
         g_runtime_services_light ? "Modo: Wi-Fi ativo, cockpit em modo leve" : "Modo: cockpit normal");
   }
 
-  if (g_lbl_comms_wifi_btn) {
+  if (screen_comms && g_lbl_comms_wifi_btn) {
     lv_label_set_text(
         g_lbl_comms_wifi_btn,
         isLandscapeUI()
@@ -5913,21 +6391,21 @@ static void refreshConfigUI()
             : "Wi-Fi");
   }
 
-  if (g_lbl_comms_lora_btn) {
+  if (screen_comms && g_lbl_comms_lora_btn) {
     lv_label_set_text(
         g_lbl_comms_lora_btn,
         isLandscapeUI() ? "Abrir menu LoRa" : "Menu LoRa");
   }
 
-  if (g_lbl_comms_rescan_btn) {
+  if (screen_comms && g_lbl_comms_rescan_btn) {
     lv_label_set_text(g_lbl_comms_rescan_btn, isLandscapeUI() ? "Rescan SD/I2C" : "Scan");
   }
 
-  if (g_lbl_comms_ble) {
+  if (screen_comms && g_lbl_comms_ble) {
     lv_label_set_text(g_lbl_comms_ble, "BLE: pendente | foco atual = Wi-Fi AP");
   }
 
-  if (g_lbl_comms_lora) {
+  if (screen_comms && g_lbl_comms_lora) {
     const LoraState lora = copyLoraState();
     lv_label_set_text_fmt(
         g_lbl_comms_lora,
@@ -5938,7 +6416,7 @@ static void refreshConfigUI()
         static_cast<unsigned long>(lora.tx_bytes));
   }
 
-  if (g_lbl_comms_gps) {
+  if (screen_comms && g_lbl_comms_gps) {
     const GpsState gps = copyGpsState();
     lv_label_set_text_fmt(
         g_lbl_comms_gps,
@@ -5948,7 +6426,7 @@ static void refreshConfigUI()
         static_cast<unsigned>(gps.sats));
   }
 
-  if (g_lbl_comms_status) {
+  if (screen_comms && g_lbl_comms_status) {
     lv_label_set_text(
         g_lbl_comms_status,
         isLandscapeUI()
@@ -5958,7 +6436,7 @@ static void refreshConfigUI()
             : (g_wifi_ap_started ? "AP ativo. Abra 192.168.4.1" : "COMMS = hub de Wi-Fi, LoRa e GPS."));
   }
 
-  if (g_lbl_lora_status) {
+  if (screen_lora && g_lbl_lora_status) {
     const LoraState lora = copyLoraState();
     lv_label_set_text_fmt(
         g_lbl_lora_status,
@@ -5968,7 +6446,7 @@ static void refreshConfigUI()
         static_cast<unsigned long>(lora.rx_bytes));
   }
 
-  if (g_lbl_lora_radio) {
+  if (screen_lora && g_lbl_lora_radio) {
     const LoraState lora = copyLoraState();
     lv_label_set_text_fmt(
         g_lbl_lora_radio,
@@ -5977,7 +6455,7 @@ static void refreshConfigUI()
         static_cast<unsigned long>(lora.tx_bytes));
   }
 
-  if (g_lbl_lora_test) {
+  if (screen_lora && g_lbl_lora_test) {
     const LoraState lora = copyLoraState();
     lv_label_set_text(
         g_lbl_lora_test,
@@ -5986,7 +6464,7 @@ static void refreshConfigUI()
             : "LoRa UART desligado.\nLigue aqui para iniciar os testes do modulo serial.");
   }
 
-  if (g_lbl_lora_toggle_btn) {
+  if (screen_lora && g_lbl_lora_toggle_btn) {
     lv_label_set_text(g_lbl_lora_toggle_btn, g_lora_enabled ? "Desligar LoRa" : "Ligar LoRa");
   }
 }
@@ -6074,7 +6552,7 @@ static void startImuTask()
   BaseType_t result = xTaskCreatePinnedToCore(
       imuTask,
       "imu_task",
-      4096,
+      8192,
       nullptr,
       1,
       &g_imu_task_handle,
@@ -6098,7 +6576,7 @@ static void startBlackboxTask()
   BaseType_t result = xTaskCreatePinnedToCore(
       blackboxTask,
       "blackbox_task",
-      6144,
+      10240,
       nullptr,
       1,
       &g_blackbox_task_handle,
@@ -6135,15 +6613,25 @@ void setup()
   initBme688Sensor();
   Serial1.begin(GPS_UART_BAUD, SERIAL_8N1, GPS_UART_RX_PIN, GPS_UART_TX_PIN);
   g_gps_uart_ready = true;
+  clearActivityHistory();
+  clearGpsActivityHistory();
   GpsState gps_state = {};
   gps_state.uart_ready = true;
+  gps_state.update_rate_hz = 1U;
   snprintf(
       gps_state.note,
       sizeof(gps_state.note),
       "UART GPS pronta | RX=%d TX=%d | aguardando NMEA",
       GPS_UART_RX_PIN,
       GPS_UART_TX_PIN);
+  snprintf(
+      gps_state.config_note,
+      sizeof(gps_state.config_note),
+      "GP10 padrao: 9600 8N1 | 1Hz | WAKE alto/solto");
+  snprintf(gps_state.last_command, sizeof(gps_state.last_command), "boot default");
   storeGpsState(gps_state);
+  appendActivityLine("BOOT", "sistema iniciado");
+  appendGpsActivityLine("BOOT", "GPS UART pronta");
   Serial.printf(
       "[GPS] UART pronta | RX=%d TX=%d | baud=%lu\n",
       GPS_UART_RX_PIN,
@@ -6211,6 +6699,7 @@ void loop()
   static uint32_t last_efis_ui = 0;
   static uint32_t last_config_ui = 0;
   static uint32_t last_auto_rotate = 0;
+  static uint32_t last_stack_diag = 0;
   const uint32_t now = millis();
 
   handleBootButton();
@@ -6298,6 +6787,41 @@ void loop()
         "[SERIAL][LORA] ultima=%s | note=%s\n",
         lora.last_message[0] ? lora.last_message : "--",
         lora.note[0] ? lora.note : "--");
+
+    const bool gps_rx_ok = gps.receiving || gps.rx_bytes > 0 || gps.line_count > 0;
+    const bool gps_fix_ok = gps.has_fix && gps.has_location;
+    const bool lora_rx_ok = lora.receiving || lora.rx_bytes > 0;
+    const bool lora_tx_ok = lora.tx_bytes > 0;
+
+    Serial.printf(
+        "[UART] GPS uart=%s rx=%s fix=%s | LORA uart=%s rx=%s tx=%s aux=%s\n",
+        gps.uart_ready ? "OK" : "OFF",
+        gps_rx_ok ? "OK" : "OFF",
+        gps_fix_ok ? "OK" : "OFF",
+        lora.uart_ready ? "OK" : "OFF",
+        lora_rx_ok ? "OK" : "OFF",
+        lora_tx_ok ? "OK" : "OFF",
+        lora.aux_high ? "HIGH" : "LOW");
+
+    if (!gps.uart_ready) {
+      Serial.println("[UART][GPS] UART OFF: revisar Serial1, boot e inicializacao.");
+    } else if (!gps_rx_ok) {
+      Serial.println("[UART][GPS] sem bytes NMEA: revisar VCC, GND, TXD->GPIO43, RXD->GPIO44, WAKE solto e vista do ceu.");
+    } else if (!gps_fix_ok) {
+      Serial.println("[UART][GPS] NMEA OK, mas sem fix: levar para area aberta e aguardar satelites.");
+    } else {
+      Serial.println("[UART][GPS] fix valido: mapa e velocidade do GPS devem ficar ativos.");
+    }
+
+    if (!lora.uart_ready) {
+      Serial.println("[UART][LORA] UART OFF: revisar Serial2 e pinos TX17/RX18.");
+    } else if (!lora.enabled) {
+      Serial.println("[UART][LORA] modulo desligado por software.");
+    } else if (!lora_rx_ok && !lora_tx_ok) {
+      Serial.println("[UART][LORA] sem trafego: revisar segunda ponta, baud, M0/M1 LOW e mesma configuracao.");
+    } else {
+      Serial.println("[UART][LORA] UART ativa: validar payloads RX/TX no console web.");
+    }
   }
 
   if (now - last_touch_ui >= 40U) {
@@ -6310,9 +6834,21 @@ void loop()
     refreshEfisUI();
   }
 
-  if (now - last_config_ui >= 250U) {
+  if (now - last_config_ui >= 500U) {
     last_config_ui = now;
     refreshConfigUI();
+  }
+
+  if (now - last_stack_diag >= 15000U) {
+    last_stack_diag = now;
+    const UBaseType_t imu_hw = g_imu_task_handle ? uxTaskGetStackHighWaterMark(g_imu_task_handle) : 0;
+    const UBaseType_t blackbox_hw = g_blackbox_task_handle ? uxTaskGetStackHighWaterMark(g_blackbox_task_handle) : 0;
+    Serial.printf(
+        "[STACK] loop heap=%lu | imu_hw=%lu words | blackbox_hw=%lu words | wifi_clients=%u\n",
+        static_cast<unsigned long>(ESP.getFreeHeap()),
+        static_cast<unsigned long>(imu_hw),
+        static_cast<unsigned long>(blackbox_hw),
+        static_cast<unsigned>(wifiClientCount()));
   }
 
   if (now - last_auto_rotate >= 250U) {
