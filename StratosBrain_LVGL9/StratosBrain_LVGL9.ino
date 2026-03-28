@@ -33,6 +33,16 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <lvgl.h>
+#include <WiFi.h>
+
+
+// Forward declarations for functions used early (types not yet known)
+struct ImuState;
+static bool ensureEfisCanvasBuffer();
+static void drawEfisHorizon(const ImuState &imu);
+static void refreshSensorCaches();
+static void efisSetLevelEventCb(lv_event_t *e);
+// NOTE: loadScreenById(AppScreenId) declared after AppScreenId enum below
 
 static constexpr int LCD_CS = 9;
 static constexpr int LCD_CLK = 10;
@@ -200,6 +210,9 @@ enum AppScreenId
   SCREEN_CONFIG
 };
 
+// Forward declaration requiring AppScreenId (enum defined above)
+static void loadScreenById(AppScreenId screen_id);
+
 enum OrientationMode
 {
   ORIENTATION_MODE_PORTRAIT = 0,
@@ -317,6 +330,10 @@ static bool g_wifi_apply_pending = false;
 static bool g_lora_enabled = false;
 static bool g_lora_uart_ready = false;
 static bool g_gps_uart_ready = false;
+static uint32_t g_plane_last_update_ms = 0;
+static float g_plane_smooth_alt = 0.0f;
+static float g_plane_smooth_vs = 0.0f;
+static float g_plane_smooth_spd = 0.0f;
 static bool g_runtime_services_light = false;
 static char g_wifi_diag_note[BLACKBOX_NOTE_LEN] = "AP desligado. Ligue em COMMS ou CONFIG.";
 static char g_wifi_sta_ssid[WIFI_STA_SSID_LEN] = "";
@@ -437,8 +454,19 @@ struct Bme688State
   char note[80];
 };
 
+struct GpsSat
+{
+  uint8_t prn;
+  uint8_t elv;
+  uint16_t az;
+  uint8_t snr;
+  char type;
+};
+
 struct GpsState
 {
+  GpsSat sats_info[32];
+  uint8_t sats_count;
   bool uart_ready;
   bool receiving;
   bool has_fix;
@@ -1231,6 +1259,7 @@ static void finalizeGpsSentence(char *sentence)
 
   const bool is_gga = strstr(fields[0], "GGA") != nullptr;
   const bool is_rmc = strstr(fields[0], "RMC") != nullptr;
+  const bool is_gsv = strstr(fields[0], "GSV") != nullptr;
 
   if (is_gga && field_count >= 10) {
     const int fix_quality = fields[6] ? atoi(fields[6]) : 0;
@@ -1260,9 +1289,34 @@ static void finalizeGpsSentence(char *sentence)
       state.has_location = true;
     }
     state.speed_kmh = speed_knots * 1.852f;
+    if (state.speed_kmh < 3.0f) {
+      state.speed_kmh = 0.0f;
+    }
     if (valid) {
       state.has_fix = true;
       state.last_fix_ms = now;
+    }
+  } else if (is_gsv && field_count >= 4) {
+    const uint8_t msg_num = atoi(fields[2]);
+    if (msg_num == 1) { 
+        if (fields[0][1] == 'G' && fields[0][2] == 'P') state.sats_count = 0; 
+    }
+    char s_type = 'G';
+    if (fields[0][1] == 'G' && fields[0][2] == 'L') s_type = 'R'; 
+    else if (fields[0][1] == 'G' && (fields[0][2] == 'B' || fields[0][2] == 'Q')) s_type = 'B'; 
+    else if (fields[0][1] == 'G' && fields[0][2] == 'A') s_type = 'E'; 
+    else if (fields[0][1] == 'B' && fields[0][2] == 'D') s_type = 'B'; 
+
+    for (int i = 0; i < 4; i++) {
+        int base = 4 + i * 4;
+        if (base + 3 < field_count && fields[base] && fields[base][0] && state.sats_count < 32) {
+            state.sats_info[state.sats_count].prn = atoi(fields[base]);
+            state.sats_info[state.sats_count].elv = atoi(fields[base + 1]);
+            state.sats_info[state.sats_count].az = atoi(fields[base + 2]);
+            state.sats_info[state.sats_count].snr = fields[base + 3][0] ? atoi(fields[base + 3]) : 0;
+            state.sats_info[state.sats_count].type = s_type;
+            state.sats_count++;
+        }
     }
   }
 
@@ -1966,6 +2020,12 @@ static void onWifiIpEvent(void *, esp_event_base_t event_base, int32_t event_id,
   char ip_text[20];
   formatIpAddress(g_wifi_sta_ip, ip_text, sizeof(ip_text));
   snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN OK em http://%s", ip_text);
+  
+  if (g_wifi_ap_requested) {
+    g_wifi_ap_requested = false;
+    g_wifi_apply_pending = true;
+    updateWifiRequestedFlag();
+  }
 }
 
 static bool ensureWifiStack()
@@ -2896,9 +2956,10 @@ static void sendHttpJsonStatus(NetworkClient &client)
       imu.roll_deg,
       imu.temperature_c);
   client.printf(
-      "\"plane\":{\"altitude_ft\":%s,\"vario_fpm\":null,\"heading_deg\":null,\"speed_kmh\":%s},",
-      scratch.plane_altitude_ft_text,
-      scratch.plane_speed_kmh_text);
+      "\"plane\":{\"avg_altitude_m\":%.1f,\"avg_vs_ms\":%.2f,\"avg_speed_kmh\":%.1f},",
+      g_plane_smooth_alt,
+      g_plane_smooth_vs,
+      g_plane_smooth_spd);
   client.printf(
       "\"meteo\":{\"theme\":\"%s\",\"summary\":\"%s\",\"connected\":%s,\"has_data\":%s,\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"altitude_m\":%.1f,\"gas_ohms\":%.0f,\"last_update_ms\":%lu,\"note\":\"%s\"},",
       scratch.meteo_theme,
@@ -2912,6 +2973,13 @@ static void sendHttpJsonStatus(NetworkClient &client)
       bme.gas_ohms,
       static_cast<unsigned long>(bme.last_update_ms),
       scratch.bme_note);
+  client.print("\"sats_arr\":[");
+  for (uint8_t i = 0; i < gps.sats_count; i++) {
+    client.printf("{\"p\":%u,\"e\":%u,\"a\":%u,\"s\":%u,\"t\":\"%c\"}%s", 
+      gps.sats_info[i].prn, gps.sats_info[i].elv, gps.sats_info[i].az, gps.sats_info[i].snr, gps.sats_info[i].type,
+      (i == gps.sats_count - 1) ? "" : ",");
+  }
+  client.print("],");
   client.printf(
       "\"gps\":{\"uart_ready\":%s,\"receiving\":%s,\"fix\":%s,\"has_location\":%s,\"sats\":%u,\"rx_bytes\":%lu,\"line_count\":%lu,\"last_rx_ms\":%lu,\"last_fix_ms\":%lu,\"lat\":%.6f,\"lon\":%.6f,\"alt_m\":%.1f,\"speed_kmh\":%.1f,\"update_hz\":%u,\"last_sentence\":\"%s\",\"note\":\"%s\",\"config_note\":\"%s\",\"last_command\":\"%s\",\"power_hint\":\"%s\",\"wiring_hint\":\"%s\",\"map_osm\":\"%s\",\"map_google\":\"%s\",\"map_hint\":\"%s\",\"history\":\"%s\"},",
       gps.uart_ready ? "true" : "false",
@@ -2992,149 +3060,193 @@ static void sendHttpJsonStatus(NetworkClient &client)
 
 static void sendHttpDashboard(NetworkClient &client)
 {
-  client.print(F("HTTP/1.1 200 OK\r\n"));
-  client.print(F("Content-Type: text/html; charset=utf-8\r\n"));
-  client.print(F("Cache-Control: no-store\r\n"));
-  client.print(F("Connection: close\r\n\r\n"));
-  client.print(F(R"SBWEB(<!DOCTYPE html><html><head><meta charset='utf-8'>
+  client.print(F("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"));
+  client.print(F(R"SBWEB(<!DOCTYPE html><html translate="no"><head><meta charset='utf-8'><meta name="google" content="notranslate">
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>StratosBrain S3</title>
+<title>StratosBrain S3 Hub</title>
 <style>
 :root{--bg:#071019;--panel:#0d1823;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59}
-*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text)}
-.wrap{padding:16px;max-width:1180px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}
-.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:6px 0 8px;font-size:34px}.lead{color:var(--muted);font-size:15px;line-height:1.5}
-.hero-grid,.grid,.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.hero-grid{margin-top:12px}
-.mini,.card{background:rgba(7,14,21,.45);border:1px solid rgba(111,214,255,.18);border-radius:16px;padding:14px;transition:background-color .24s ease,border-color .24s ease,color .18s ease,opacity .18s ease}.card{background:var(--panel);border-color:#21364a}
-.mini b,.card h3{display:block;margin:0 0 8px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}
-.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}
+*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text);overscroll-behavior:none}
+.wrap{padding:16px;max-width:1180px;margin:0 auto}
+.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}
+.hero h1{margin:6px 0 8px;font-size:34px}.lead{color:var(--muted);font-size:15px;line-height:1.5}
+.grid,.hero-grid,.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.mini,.card{background:var(--panel);border:1px solid #21364a;border-radius:16px;padding:14px;transition:opacity .2s}
+.mini b,.card h3{margin:0 0 8px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}
+.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}
 .btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.small{padding:8px 12px;font-size:13px}
-.tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}
-.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.muted{color:var(--muted);font-size:14px;line-height:1.55}.mono{font-family:Consolas,monospace}
-.footer{margin-top:14px;color:var(--muted);font-size:12px;transition:color .18s ease,opacity .18s ease}
+.tab{background:#0c1722;border:1px solid #20384d}.tab.active{background:#143048;border-color:#4abfff}
+.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.muted{color:var(--muted);font-size:14px}.mono{font-family:monospace}
 .pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;border:1px solid #275779;background:#123046;color:#dff6ff;font-size:12px;font-weight:700}
-.pill.ok{border-color:#2f7b5a;background:#10281d;color:#d8ffe9}
-.pill.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}
-.pill.off{border-color:#5a3030;background:#281313;color:#ffd8d8}
-input{width:100%;background:#08131d;border:1px solid #21445f;border-radius:10px;color:#eef6ff;padding:10px 12px;margin-top:8px}
-pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:Consolas,monospace;background:#08131d;border:1px solid #1d3245;border-radius:12px;padding:12px;min-height:150px;color:#d7edf7}
+.pill{padding:5px 10px;border-radius:999px;border:1px solid #275779;background:#123046;font-size:12px;font-weight:700}
+.pill.ok{border-color:#2f7b5a;background:#10281d;color:#d8ffe9}.pill.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}
+input{width:100%;background:#08131d;border:1px solid #21445f;border-radius:10px;color:#eef6ff;padding:10px;margin-top:8px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#08131d;border:1px solid #1d3245;border-radius:12px;padding:12px;min-height:100px;color:#d7edf7}
+#skyplot{background:#070f15;border-radius:50%;width:100%;max-width:300px;aspect-ratio:1;display:block;margin:10px auto;border:1px solid #21364a}
+.ttip{position:relative;display:inline-block;cursor:help;border-bottom:1px dotted #6fd6ff}
 </style></head><body><div class='wrap'>
-<div class='hero'><div class='eyebrow'>StratosBrain S3</div><h1>Lab Web</h1><div class='lead'>Painel de bancada para validar BME688, GPS, SD card e conectividade local sem trocar de firmware.</div>
+<div class='hero'><h1>StratosBrain Hub</h1><div class='lead'>Estacao de telemetria AJAX suave.</div>
 <div class='hero-grid'>
-<div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div>
-<div class='mini'><b>LAN local</b><span id='heroLan'>--</span></div>
-<div class='mini'><b>URL principal</b><span class='mono' id='heroUrl'>--</span></div>
-<div class='mini'><b>Estado da web</b><span id='heroMode'>--</span></div>
-</div>
-<div class='actions'>
-<button class='btn alt' onclick="act('wifi=toggle')">AP on/off</button>
-<button class='btn small' onclick="act('logger=toggle')">Logger on/off</button>
-<button class='btn small' onclick="act('rescan=1')">Rescan</button>
-<button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button>
-</div></div>
+<div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div><div class='mini'><b>LAN Local</b><span id='heroLan'>--</span></div>
+<div class='mini'><b>IP</b><span class='mono' id='heroIp'>--</span></div>
+</div><div class='actions'><button class='btn alt' onclick="act('wifi=toggle')">Wi-Fi AP</button><button class='btn small' onclick="act('logger=toggle')">Logger SD</button><button class='btn warn' onclick="act('lora=toggle')">LoRa RX</button></div></div>
 <div class='tabs'>
-<button class='btn tab active' data-tab='lab' onclick="setTab('lab')">Lab</button>
+<button class='btn tab active' data-tab='lab' onclick="setTab('lab')">Dashboard</button>
 <button class='btn tab' data-tab='gps' onclick="setTab('gps')">GPS</button>
-<button class='btn tab' data-tab='sd' onclick="setTab('sd')">SD</button>
-<button class='btn tab' data-tab='meteo' onclick="setTab('meteo')">Meteo</button>
+<button class='btn tab' data-tab='sd' onclick="setTab('sd')">Cartão SD</button>
+<button class='btn tab' data-tab='meteo' onclick="setTab('meteo')">Meteorologia</button>
 <button class='btn tab' data-tab='comms' onclick="setTab('comms')">Rede</button>
 <button class='btn tab' data-tab='lora' onclick="setTab('lora')">LoRa</button>
-<button class='btn tab' data-tab='config' onclick="setTab('config')">Config</button>
-<button class='btn tab' data-tab='overview' onclick="setTab('overview')">Overview</button>
+<button class='btn tab' data-tab='config' onclick="setTab('config')">Configuração</button>
+<button class='btn tab' data-tab='plane' onclick="setTab('plane')">Aviação</button>
+<button class='btn tab' data-tab='overview' onclick="setTab('overview')">Visão geral</button>
 </div>)SBWEB"));
   client.print(F(R"SBWEB(
 <section class='section active' id='section-lab'><div class='split'>
-<div class='card'><h3>BME688</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Endereco: <span class='mono' id='labBmeAddr'>--</span><br>Temp: <span id='labBmeTemp'>--</span><br>Umidade: <span id='labBmeHum'>--</span><br>Pressao: <span id='labBmePress'>--</span><br>Altitude: <span id='labBmeAlt'>--</span><br>Gas: <span id='labBmeGas'>--</span><br>Nariz digital: <span id='labBmeGasMode'>--</span><br>Nota: <span id='labBmeNote'>--</span></div></div>
-<div class='card'><h3>GPS</h3><div class='big' id='labGpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44 @ 9600</span><br>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Alt/Vel: <span id='labGpsMotion'>--</span><br>Ultima NMEA: <span class='mono' id='labGpsSentence'>--</span><br>Cfg: <span id='labGpsCfg'>--</span></div></div>
-<div class='card'><h3>LoRa UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>Pinos: <span class='mono'>TX17 RX18 AUX6 M0/1 7/8</span><br>AUX: <span id='labLoraAux'>--</span><br>RX/TX bytes: <span id='labLoraTraffic'>--</span><br>Ultima msg: <span class='mono' id='labLoraMsg'>--</span><br>Nota: <span id='labLoraNote'>--</span></div><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button><button class='btn small' onclick="setTab('lora')">Abrir console LoRa</button></div></div>
-<div class='card'><h3>UART Monitor</h3><div class='muted'>Status rapido para descobrir se cada barramento esta vivo antes de investigar fix ou payload.</div><div class='pills'><span class='pill off' id='uartGpsUart'>GPS UART OFF</span><span class='pill off' id='uartGpsRx'>GPS RX OFF</span><span class='pill off' id='uartGpsFix'>GPS FIX OFF</span><span class='pill off' id='uartLoraUart'>LoRa UART OFF</span><span class='pill off' id='uartLoraRx'>LoRa RX OFF</span><span class='pill off' id='uartLoraTx'>LoRa TX OFF</span></div><div class='footer' id='uartHint'>Aguardando diagnostico...</div></div>
+<div class='card'><h3>BME688 Status</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Pitch/Roll: <span id='ovPitch'>--</span> / <span id='ovRoll'>--</span><br>SD: <span id='sdLogger'>--</span></div></div>
+<div class='card'><h3>GPS NMEA</h3><div class='big' id='labGpsState'>--</div><div class='muted'>Fix: <span id='labGpsFix'>--</span><br>Sats: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Ultima: <span class='mono' id='labGpsSentence'>--</span></div></div>
+<div class='card'><h3>LoRa Status</h3><div class='big' id='labLoraState'>--</div><div class='muted'>Tráfego RX: <span id='lrRx2'>--</span> | TX: <span id='lrTx2'>--</span><br>Pinos: TX17 RX18 AUX6<br>Ultima lida: <span class='mono' id='lrMsg2'>--</span></div><div class='actions'><button class='btn small' onclick="act('lora_tx=ping')">Polo Ping</button></div></div>
+</div></section>
+<section class='section' id='section-plane'><div class='split'>
+<div class='card'><h3>Cockpit Virtual</h3><div class='muted'>Altitude e velocidade combinadas BME688 + GPS com filtro EMA.</div></div>
+<div class='card'><h3>Alt / ASL media</h3><div class='big' style='font-size:42px;color:#FFD34D' id='pltAlt'>--</div></div>
+<div class='card'><h3>Vel. Vertical</h3><div class='big' style='font-size:42px;color:#45D1FF' id='pltVs'>--</div></div>
+<div class='card'><h3>Velocidade (GPS)</h3><div class='big' style='font-size:42px;color:#FFB357' id='pltSpd'>--</div></div>
+<div class='card'><h3>Horizonte Artificial (Web)</h3><canvas id='ahCanvas' style='display:block;margin:0 auto;border-radius:12px;background:#0a1520;border:1px solid #21364a' width='220' height='120'></canvas><div class='muted' style='margin-top:6px;text-align:center'>Pitch: <span id='ahPitch'>--</span> &nbsp; Roll: <span id='ahRoll'>--</span></div></div>
 </div></section>
 <section class='section' id='section-gps'><div class='split'>
-<div class='card'><h3>Status GPS</h3><div class='big' id='gpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44 @ 9600</span><br>Fix: <span id='gpsFix'>--</span><br>Satelites: <span id='gpsSats'>--</span><br>Recebendo: <span id='gpsReceiving'>--</span><br>Bytes RX: <span id='gpsBytes'>--</span><br>Linhas NMEA: <span id='gpsLines'>--</span><br>Ultimo RX: <span id='gpsLastRx'>--</span><br>Ultimo fix: <span id='gpsLastFix'>--</span><br>Update rate: <span id='gpsRate'>--</span><br>Ultimo cmd: <span class='mono' id='gpsLastCmd'>--</span></div></div>
-<div class='card'><h3>Posicao</h3><div class='big' id='gpsLatLon'>--</div><div class='muted'>Altitude: <span id='gpsAlt'>--</span><br>Velocidade: <span id='gpsSpeed'>--</span><br>Nota: <span id='gpsNote'>--</span><br>Config: <span id='gpsCfg'>--</span></div></div>
-<div class='card'><h3>Mapa</h3><div class='muted'>Abra o mapa no celular quando houver coordenadas validas.<br>Dica: o AP puro pode deixar o celular sem internet; em `LAN` o mapa tende a funcionar melhor.</div><div class='actions'><a class='btn small' id='gpsOsmLink' href='#' target='_blank' rel='noopener noreferrer'>OpenStreetMap</a><a class='btn small' id='gpsGoogleLink' href='#' target='_blank' rel='noopener noreferrer'>Google Maps</a></div><div class='footer' id='gpsMapHint'>--</div></div>
-<div class='card'><h3>Diagnostico GP10</h3><div class='muted'>Alimentacao: <span id='gpsPowerHint'>--</span><br>Ligacao: <span class='mono' id='gpsWiringHint'>--</span><br>Busca de satelites: use area aberta, sem teto, motores ou fontes proximas.<br>1PPS: depois do fix, o LED/PPS deve pulsar 1 vez por segundo.</div></div>
-<div class='card'><h3>Controles GP10</h3><div class='muted'>Use estes comandos para bancada e recuperacao rapida do GPS.</div><div class='actions'><button class='btn small' onclick="act('gps_restart=cold')">Cold Start</button><button class='btn small' onclick="act('gps_restart=hot')">Hot Start</button><button class='btn small' onclick="act('gps_rate=1')">1Hz</button><button class='btn small' onclick="act('gps_rate=5')">5Hz</button><button class='btn small' onclick="act('gps_constellation=all')">All GNSS</button><button class='btn small' onclick="act('gps_constellation=gps_bds')">GPS+BDS</button><button class='btn small' onclick="act('gps_nmea=all_on')">All NMEA ON</button></div></div>
-<div class='card'><h3>Atividade recente GPS</h3><pre id='gpsHistory'>--</pre></div>
-<div class='card'><h3>Ultima NMEA</h3><pre id='gpsSentence'>--</pre></div>
-</div></section>
-<section class='section' id='section-sd'><div class='split'>
-<div class='card'><h3>Status SD</h3><div class='big' id='sdState'>--</div><div class='muted'>Capacidade: <span id='sdSize'>--</span><br>Logger: <span id='sdLogger'>--</span><br>Arquivo: <span class='mono' id='sdFile'>--</span><br>Nome: <span class='mono' id='sdName'>--</span><br>Registros: <span id='sdRecords'>--</span><br>Ultima escrita: <span id='sdLast'>--</span><br>Nota: <span id='sdNote'>--</span></div><div class='actions'><button class='btn small' onclick="act('logger=toggle')">Logger on/off</button><button class='btn small' onclick="act('sd=remount')">Remount SD</button></div></div>
-<div class='card'><h3>Ultimos registros</h3><pre id='sdTail'>--</pre></div>
+<div class='card'><h3>Skyplot Constelacoes</h3><div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px'><span class='pill ok' id='skpTotal'>-- sats</span><span class='pill' style='border-color:#41d39b;color:#41d39b' id='skpGps'>GPS 0</span><span class='pill' style='border-color:#c872ff;color:#c872ff' id='skpGlo'>GLO 0</span><span class='pill' style='border-color:#ff7a59;color:#ff7a59' id='skpBds'>BDS 0</span><span class='pill' style='border-color:#6fd6ff;color:#6fd6ff' id='skpGal'>GAL 0</span></div><canvas id='skyplot'></canvas></div>
+<div class='card'><h3>Dados do Voo</h3><div class='big' id='gpsSpeed'>--</div><div class='muted'>Loc: <span class='mono' id='gpsLatLon'>--</span><br>Alt: <span id='gpsAlt'>--</span><br>Atualizacao: <span id='gpsRate'>--</span><br>Ultimo RX: <span id='gpsLastRx'>--</span></div><div class='actions'><a class='btn small' id='gpsOsmLink' href='#' target='_blank'>OpenStreetMap</a><a class='btn small' id='gpsGoogleLink' href='#' target='_blank'>Google Maps</a></div></div>
+<div class='card'><h3>Controles GP10 (CASIC)</h3><div class='actions'>
+<button class='btn small' onclick="act('gps_restart=cold')" title="Cold Start: apaga almanaques, reinicia busca cega. Demora achar FIX.">Partida a frio</button>
+<button class='btn small' onclick="act('gps_restart=hot')" title="Hot Start: aproveita memórias, fix super rápido se moveu pouco.">Inicio Rapido</button>
+<button class='btn small' onclick="act('gps_rate=1')" title="1 atualização de posição por segundo.">1Hz</button>
+<button class='btn small' onclick="act('gps_rate=5')" title="5 atualizações por segundo. (Atenção ao tráfego UART)">5Hz</button>
+</div><div class='actions' style='margin-top:6px;'>
+<button class='btn small' onclick="act('gps_constellation=all')" title="Habilita GPS + BDS + GLONASS. Máquina consome +energia.">Todos os GNSS</button>
+<button class='btn small' onclick="act('gps_constellation=gps_bds')" title="Habilita GPS + BeiDou apenas. Ideal na nossa região.">GPS+BDS</button>
+<button class='btn small' onclick="act('gps_nmea=all_on')" title="Volta a emitir todas de GSV/GSA.">NMEA Full</button>
+</div><div class='muted' style='margin-top:10px'>Comandos despachados ao modulo UART1.</div></div>
+<div class='card'><h3>Terminal Serial GPS</h3><pre id='gpsSentence'>--</pre></div>
 </div></section>
 <section class='section' id='section-meteo'><div class='split'>
-<div class='card'><h3>Clima</h3><div class='big' id='mtTheme'>--</div><div class='muted' id='mtSummary'>--</div><div class='footer'>Gas bruto: <span id='mtGas'>--</span><br>BME688 IA/odores: etapa futura com BSEC2 + treino.</div></div>
-<div class='card'><h3>Altitude</h3><div class='big' id='mtAlt'>--</div><div class='muted'>estimada pela pressao do BME688</div></div>
-<div class='card'><h3>Pressao</h3><div class='big' id='mtPress'>--</div><div class='muted'>leitura barometrica</div></div>
-<div class='card'><h3>Temperatura</h3><div class='big' id='mtTemp'>--</div><div class='muted'>ambiente local</div></div>
-<div class='card'><h3>Umidade</h3><div class='big' id='mtHum'>--</div><div class='muted'>umidade relativa</div></div>
+<div class='card'><h3>Ambiente Atmosférico</h3><div class='big' id='labBmeTemp'>--</div><div class='muted'>Umidade: <span id='labBmeHum'>--</span><br>Alt Baro: <span id='labBmeAlt'>--</span><br>Pressão: <span id='labBmePress'>--</span></div></div>
+<div class='card'><h3>Bosch BSEC Gás</h3><div class='big' id='mtGas'>--</div><div class='muted'>I2C: <span class='mono' id='cmScan'>--</span></div></div>
+<div class='card' style='grid-column:1/-1'><h3>Previsão Meteorológica Local</h3><div class='big' style='color:#6fd6ff' id='labBmeNote'>--</div></div>
+</div></section>
+<section class='section' id='section-lora'><div class='split'>
+<div class='card'><h3>LoRa Escuta (Sniffer)</h3><div class='big' id='lrState'>--</div><div class='muted'>Interceptando pacotes sem filtro.<br>Ultima msg decodificada: <span class='mono' id='lrMsg'>--</span></div><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">Ligar/Desligar LoRa</button><button class='btn small' onclick="act('lora_tx=status')">Despachar STATUS</button></div></div>
+<div class='card'><h3>Envelopes RF TX</h3><input id='lrPayload' type='text' placeholder='Ex: ALVO=ALPHA,T=33'><button class='btn small' style='margin-top:8px' onclick="sendLoraPayload()">Fogo</button></div>
+<div class='card' style='grid-column:1/-1'><h3>Terminal Interceptacao</h3><pre id='lrConsole'>--</pre></div>
 </div></section>
 <section class='section' id='section-comms'><div class='split'>
-<div class='card'><h3>Rede</h3><div class='muted'>Modo: <span id='cmMode'>--</span><br>AP: <span class='mono' id='cmApUrl'>--</span><br>LAN: <span class='mono' id='cmStaUrl'>--</span><br>Clientes AP: <span id='cmClients'>--</span><br>Hits web: <span id='cmHits'>--</span><br>Nota: <span id='cmNote'>--</span><br>Nota LAN: <span id='cmStaNote'>--</span></div></div>
-<div class='card'><h3>Entrar na rede local</h3><div class='muted'>SSID</div><input id='cmStaSsid' type='text' placeholder='Wi-Fi da casa'><div class='muted'>Senha</div><input id='cmStaPass' type='password' placeholder='Senha da rede'><div class='actions'><button class='btn alt' onclick='connectSta()'>Conectar LAN</button><button class='btn small' onclick="act('sta=off')">Desligar LAN</button><button class='btn small' onclick="act('sta=forget')">Limpar</button></div></div>
-<div class='card'><h3>Mapa de integracao</h3><div class='muted'>Sensores: <span id='cmSensors'>--</span><br>Rotas: <span id='cmRoutes'>--</span><br>Scan I2C: <span class='mono' id='cmScan'>--</span></div></div>
+<div class='card'><h3>Status Wi-Fi</h3><div class='muted' style='color:#ffb357'>Aviso: ao conectar no Wi-Fi residencial, o AP (192.168.4.1) sera desligado. Acesse pelo novo IP!</div><div class='muted' style='margin-top:8px'>AP Clients: <span id='cmClients'>--</span> | Hits: <span id='cmHits'>--</span></div></div>
+<div class='card'><h3>Redes Disponiveis</h3><button class='btn small' onclick='scanWifi()'>Varrer Redes Wi-Fi</button><div id='wifiList' style='margin-top:10px;display:flex;flex-direction:column;gap:6px'><div class='muted'>Clique em Varrer para listar redes.</div></div></div>
+<div class='card'><h3>Conectar na Rede</h3><input id='cmStaSsid' type='text' placeholder='SSID (ou clique na lista acima)'><input id='cmStaPass' type='password' placeholder='Senha'><div class='actions'><button class='btn alt' onclick='connectSta()'>Conectar</button><button class='btn small warn' onclick="act('sta=off')">Desconectar</button></div></div>
 </div></section>)SBWEB"));
+
   client.print(F(R"SBWEB(
-<section class='section' id='section-lora'><div class='split'><div class='card'><h3>Estado LoRa</h3><div class='big' id='lrState'>--</div><div class='muted'>UART: <span class='mono'>TX17 RX18 | AUX6 | M0/1 7/8</span><br>AUX: <span id='lrAux'>--</span><br>RX bytes: <span id='lrRx'>--</span><br>TX bytes: <span id='lrTx'>--</span><br>Ultimo RX: <span id='lrLastRx'>--</span><br>Ultimo TX: <span id='lrLastTx'>--</span><br>Ultima msg: <span class='mono' id='lrMsg'>--</span><br>Nota: <span id='lrPlan'>--</span></div><div class='footer' id='lrConsoleHint'>--</div></div><div class='card'><h3>Console LoRa</h3><div class='muted'>Mostra o trafego de payload/UART do modulo LoRa. Nao mostra espectro RF bruto como SDR. Destino atual: outro modulo LoRa remoto com a mesma configuracao, nao um servidor web automatico.</div><input id='lrPayload' type='text' placeholder='Ex: TEMP=27.5,PRESS=1008.2'><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button><button class='btn small' onclick="sendLoraPayload()">Enviar payload</button><button class='btn small' onclick="act('lora_tx=ping')">PING</button><button class='btn small' onclick="act('lora_tx=status')">STATUS?</button><button class='btn small' onclick="act('lora_tx=meteo')">Enviar METEO</button><button class='btn small' onclick="act('lora_tx=gps')">Enviar GPS</button><button class='btn small' onclick="act('lora_clear=1')">Limpar console</button></div><pre id='lrConsole'>--</pre></div></div></section>
-<section class='section' id='section-config'><div class='split'><div class='card'><h3>Config</h3><div class='muted'>Tela do dispositivo: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Orientacao: <span id='cfOrientation'>--</span><br>Rotacao: <span id='cfRotation'>--</span><br>Logger: <span id='cfLogger'>--</span><br>Ultima escrita: <span id='cfLastLog'>--</span></div></div><div class='card'><h3>SD e sensores</h3><div class='muted'>Arquivo: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Nota SD: <span id='cfNote'>--</span><br>Sensores: <span id='cfSensors'>--</span><br>Scan I2C: <span class='mono' id='cfScan'>--</span></div></div></div></section>
-<section class='section' id='section-overview'><div class='grid'><div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes AP: <span id='ovClients'>--</span></div></div><div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div><div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div><div class='card'><h3>Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div><div class='card'><h3>Atividade recente</h3><pre id='ovActivity'>--</pre></div></div></section>
 <script>
 const $=i=>document.getElementById(i), txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v, toText=v=>String(txt(v));
 const put=(i,v)=>{const e=$(i); if(!e)return; const next=toText(v); if(e.textContent!==next)e.textContent=next;};
-const val=(i,v)=>{const e=$(i); const next=v||''; if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
+const val=(i,v)=>{const e=$(i); const next=toText(v); if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
 const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
-function setPill(id,label,state){const e=$(id); if(!e)return; const next=toText(label); if(e.textContent!==next)e.textContent=next; const cls='pill '+(state||'off'); if(e.className!==cls)e.className=cls;}
-function linkify(id,href,label){const e=$(id); if(!e)return; const enabled=!!(href&&href!==''&&href!=='--'); const nextHref=enabled?href:'#'; const nextLabel=enabled?(label||href):(label||'Indisponivel'); const nextOpacity=enabled?'1':'.5'; const nextPointer=enabled?'auto':'none'; if(e.href!==nextHref)e.href=nextHref; if(e.textContent!==nextLabel)e.textContent=nextLabel; if(e.style.pointerEvents!==nextPointer)e.style.pointerEvents=nextPointer; if(e.style.opacity!==nextOpacity)e.style.opacity=nextOpacity;}
 function setTab(n){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}
-let refreshBusy=false,lastRefreshAt=0,refreshTimer=null;
-function scheduleRefresh(delayMs=0){if(refreshTimer)clearTimeout(refreshTimer); refreshTimer=setTimeout(()=>refresh(true),delayMs);}
-function act(q,delayMs=320){fetch('/api/action?'+q,{cache:'no-store'}).then(()=>scheduleRefresh(delayMs)).catch(()=>scheduleRefresh(900));}
-function fmtMs(v){return(v===undefined||v===null||v===0)?'--':String(v)+' ms';} function fmtUrl(ip){return(!ip||ip==='--')?'--':'http://'+ip;} function fmtBytes(v){if(!v)return'--'; const gb=v/1073741824; if(gb>=1)return gb.toFixed(1)+' GB'; return (v/1048576).toFixed(1)+' MB';}
-function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){alert('Digite o SSID da rede local.'); return;} act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on',1200);}
-function sendLoraPayload(){const payload=$('lrPayload').value.trim(); if(!payload){alert('Digite um payload para enviar no LoRa.'); return;} act('lora_payload='+encodeURIComponent(payload),500);}
+function act(q){fetch('/api/action?'+q).then(()=>fetchData()).catch(e=>console.log("Action Fetch Err",e));}
+function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(ssid) act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on');}
+function sendLoraPayload(){const p=$('lrPayload').value.trim(); if(p) act('lora_payload='+encodeURIComponent(p));}
 ['cmStaSsid','cmStaPass'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>e.dataset.user='1');});
-function refresh(force=false){const now=Date.now(); if(refreshBusy)return; if(!force&&now-lastRefreshAt<3200)return; refreshBusy=true; fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{const webState=(d.wifi.ap?'AP estavel':'AP offline')+(d.wifi.sta_connected?' | LAN OK':'')+(d.runtime_light?' | modo leve':' | modo normal'); put('heroAp',yes(d.wifi.ap,'AP ativo','AP offline')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?('Conectando em '+txt(d.wifi.sta_ssid,'--')):'LAN desligada')); put('heroUrl',fmtUrl(d.wifi.ip)); put('heroMode',webState);
-put('labBmeState',d.meteo.connected?(d.meteo.has_data?'BME lendo':'BME detectado'):'BME OFF'); put('labBmeAddr',d.sensors.scan.includes('0x77')?'0x77':(d.sensors.scan.includes('0x76')?'0x76':'--')); put('labBmeTemp',num(d.meteo.temperature_c,' C')); put('labBmeHum',num(d.meteo.humidity_pct,' %')); put('labBmePress',num(d.meteo.pressure_hpa,' hPa')); put('labBmeAlt',num(d.meteo.altitude_m,' m')); put('labBmeGas',num(d.meteo.gas_ohms,' ohms')); put('labBmeGasMode',d.meteo.has_data?'Gas bruto OK | IA futura':'Aguardando leitura'); put('labBmeNote',txt(d.meteo.note));
-put('labGpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'NMEA RX':'GPS aguardando')); put('labGpsFix',d.gps.fix?('OK / '+txt(d.gps.sats)+' sats'):'sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsMotion',num(d.gps.alt_m,' m')+' / '+num(d.gps.speed_kmh,' km/h')); put('labGpsSentence',txt(d.gps.last_sentence)); put('labGpsCfg',txt(d.gps.config_note));
-put('labLoraState',d.lora.enabled?(d.lora.receiving?'RX ativo':'LoRa ON'):'LoRa OFF'); put('labLoraAux',yes(d.lora.aux_high,'HIGH','LOW')); put('labLoraTraffic',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes)); put('labLoraMsg',txt(d.lora.last_message)); put('labLoraNote',txt(d.lora.note));
-const gpsRxOk=!!(d.gps.receiving||d.gps.rx_bytes>0||d.gps.line_count>0), gpsFixOk=!!(d.gps.fix&&d.gps.has_location), loraRxOk=!!(d.lora.receiving||d.lora.rx_bytes>0), loraTxOk=!!(d.lora.tx_bytes>0), loraUartOk=!!d.lora.uart_ready;
-setPill('uartGpsUart',d.gps.uart_ready?'GPS UART OK':'GPS UART OFF',d.gps.uart_ready?'ok':'off'); setPill('uartGpsRx',gpsRxOk?'GPS RX OK':'GPS RX OFF',gpsRxOk?'ok':'off'); setPill('uartGpsFix',gpsFixOk?'GPS FIX OK':'GPS FIX OFF',gpsFixOk?'ok':(gpsRxOk?'warn':'off')); setPill('uartLoraUart',loraUartOk?'LoRa UART OK':'LoRa UART OFF',loraUartOk?'ok':'off'); setPill('uartLoraRx',loraRxOk?'LoRa RX OK':'LoRa RX OFF',loraRxOk?'ok':(d.lora.enabled?'warn':'off')); setPill('uartLoraTx',loraTxOk?'LoRa TX OK':'LoRa TX OFF',loraTxOk?'ok':(d.lora.enabled?'warn':'off'));
-put('uartHint',gpsFixOk?'GPS com coordenadas validas; mapa pronto para habilitar.':(gpsRxOk?'GPS com NMEA, mas ainda sem fix. Teste ao ar livre.':(d.gps.uart_ready?'GPS sem bytes NMEA. Revisar VCC/TXD/RXD/WAKE.':(loraUartOk?(loraRxOk||loraTxOk?'LoRa UART viva com trafego detectado.':'LoRa UART pronta, mas sem trafego real ainda.'):txt(d.lora.note,'Aguardando diagnostico UART.')))));
-put('gpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'recebendo NMEA':'aguardando')); put('gpsFix',yes(d.gps.fix,'fix valido','sem fix')); put('gpsSats',txt(d.gps.sats)); put('gpsReceiving',yes(d.gps.receiving,'sim','nao')); put('gpsBytes',txt(d.gps.rx_bytes)); put('gpsLines',txt(d.gps.line_count)); put('gpsLastRx',fmtMs(d.gps.last_rx_ms)); put('gpsLastFix',fmtMs(d.gps.last_fix_ms)); put('gpsRate',txt(d.gps.update_hz?d.gps.update_hz+' Hz':'1 Hz')); put('gpsLastCmd',txt(d.gps.last_command)); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsNote',txt(d.gps.note)); put('gpsCfg',txt(d.gps.config_note)); put('gpsSentence',txt(d.gps.last_sentence)); put('gpsPowerHint',txt(d.gps.power_hint)); put('gpsWiringHint',txt(d.gps.wiring_hint)); put('gpsMapHint',txt(d.gps.map_hint)); put('gpsHistory',txt(d.gps.history).replaceAll('\\n','\n')); linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps');
-put('sdState',yes(d.blackbox.mounted,'montado','sem cartao')); put('sdSize',fmtBytes(d.blackbox.card_size_bytes)); put('sdLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('sdFile',txt(d.blackbox.file)); put('sdName',txt(d.blackbox.file_name)); put('sdRecords',txt(d.blackbox.records)); put('sdLast',fmtMs(d.blackbox.last_log_ms)); put('sdNote',txt(d.blackbox.note)); put('sdTail',txt(d.blackbox.tail).replaceAll('\\n','\n'));
-put('mtTheme',txt(d.meteo.theme)); put('mtSummary',txt(d.meteo.summary)); put('mtTemp',num(d.meteo.temperature_c,' C')); put('mtHum',num(d.meteo.humidity_pct,' %')); put('mtPress',num(d.meteo.pressure_hpa,' hPa')); put('mtAlt',num(d.meteo.altitude_m,' m')); put('mtGas',num(d.meteo.gas_ohms,' ohms'));
-put('cmMode',txt(d.wifi.mode)); put('cmApUrl',fmtUrl(d.wifi.ap_ip)); put('cmStaUrl',d.wifi.sta_connected?fmtUrl(d.wifi.sta_ip):'--'); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); put('cmNote',txt(d.wifi.note)); put('cmStaNote',txt(d.wifi.sta_note)); put('cmSensors',txt(d.sensors.summary)); put('cmRoutes',txt(d.sensors.routes)); put('cmScan',txt(d.sensors.scan)); val('cmStaSsid',txt(d.wifi.sta_ssid,''));
-put('lrState',yes(d.lora.enabled,'ligado','desligado')); put('lrAux',yes(d.lora.aux_high,'HIGH','LOW')); put('lrRx',txt(d.lora.rx_bytes)); put('lrTx',txt(d.lora.tx_bytes)); put('lrLastRx',fmtMs(d.lora.last_rx_ms)); put('lrLastTx',fmtMs(d.lora.last_tx_ms)); put('lrMsg',txt(d.lora.last_message)); put('lrPlan',txt(d.lora.note)); put('lrConsole',txt(d.lora.history).replaceAll('\\n','\n')); put('lrConsoleHint',txt(d.lora.console_note));
-put('cfScreen',txt(d.screen_label)); put('cfMode',d.runtime_light?'leve':'normal'); put('cfOrientation',txt(d.ui.orientation)); put('cfRotation',txt(d.ui.rotation)); put('cfLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('cfLastLog',fmtMs(d.blackbox.last_log_ms)); put('cfFile',txt(d.blackbox.file)); put('cfRecords',txt(d.blackbox.records)); put('cfNote',txt(d.blackbox.note)); put('cfSensors',txt(d.sensors.known)); put('cfScan',txt(d.sensors.scan));
-put('ovUptime',num(d.uptime_s,' s')); put('ovHits',txt(d.wifi.web_hits)); put('ovClients',txt(d.wifi.clients)); put('ovImu',d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF'); put('ovPitch',num(d.imu.pitch_deg,' deg')); put('ovRoll',num(d.imu.roll_deg,' deg')); put('ovTemp',num(d.imu.temperature_c,' C')); put('ovTouch',yes(d.touch.pressed,'ON','OFF')); put('ovTouchXY',txt(d.touch.x)+','+txt(d.touch.y)); put('ovTouchCount',txt(d.touch.count)); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records)); put('ovActivity',txt(d.activity.recent).replaceAll('\\n','\n')); lastRefreshAt=Date.now();}).catch(()=>{}).finally(()=>{refreshBusy=false;});}
-setTab('lab'); refresh(true); setInterval(()=>refresh(false),4000);
+function scanWifi(){
+  const box=$('wifiList'); if(box)box.innerHTML="<div class='muted'>Varrendo...</div>";
+  fetch('/api/scan').then(r=>r.json()).then(d=>{
+    if(!d.networks||!d.networks.length){if(box)box.innerHTML="<div class='muted'>Nenhuma rede encontrada.</div>";return;}
+    if(box)box.innerHTML=d.networks.map(n=>{
+      const bars=n.rssi>-60?'▂▄▆█':n.rssi>-75?'▂▄▆':n.rssi>-85?'▂▄':'▂';
+      const lock=n.enc?'🔒':'';
+      return `<div style='display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:#0b1a28;border:1px solid #21364a;border-radius:10px;cursor:pointer' onclick='selectNetwork("${n.ssid.replace(/"/g,'&quot;')}")'>` +
+        `<span style='font-weight:700'>${n.ssid}</span><span style='color:var(--muted);font-size:13px'>${lock} ${bars} ${n.rssi}dBm</span></div>`;
+    }).join('');
+  }).catch(()=>{if(box)box.innerHTML="<div class='muted'>Erro ao varrer.</div>";});}
+function selectNetwork(ssid){const e=$('cmStaSsid');if(e){e.value=ssid;e.dataset.user='1';}$('cmStaPass').focus();}
+
+function plotSky(sats){const cvs=$('skyplot'); if(!cvs)return; const r=cvs.width=cvs.offsetWidth, h=cvs.height=cvs.offsetHeight, ctx=cvs.getContext('2d'), cx=r/2, cy=h/2, maxR=cx*0.9;
+ctx.clearRect(0,0,r,h); ctx.strokeStyle='#21445f'; ctx.lineWidth=1;
+[1,0.66,0.33].forEach(f=>{ctx.beginPath(); ctx.arc(cx,cy,maxR*f,0,2*Math.PI); ctx.stroke();});
+for(let i=0;i<12;i++){ctx.beginPath();const a=i*30*Math.PI/180; ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(a)*maxR, cy+Math.sin(a)*maxR); ctx.stroke();}
+if(!sats||!sats.length)return;
+sats.forEach(s=>{
+  const el=Math.max(0,Math.min(90,s.e)), az=s.a||0, dist=maxR*(90-el)/90, ang=(az-90)*Math.PI/180, px=cx+Math.cos(ang)*dist, py=cy+Math.sin(ang)*dist;
+  let c='#41d39b'; if(s.t==='R')c='#c872ff'; else if(s.t==='B')c='#ff7a59'; else if(s.t==='E')c='#6fd6ff';
+  ctx.beginPath(); ctx.arc(px,py,s.s>0?6:4,0,2*Math.PI); ctx.fillStyle=s.s>0?c:'rgba(150,150,150,0.5)'; ctx.fill(); ctx.strokeStyle='#000'; ctx.stroke();
+  ctx.fillStyle='#fff'; ctx.font='10px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(s.p, px, py-10);
+});}
+
+function drawAH(pitch, roll){
+  const cvs=document.getElementById('ahCanvas'); if(!cvs)return;
+  const w=cvs.width,h=cvs.height,ctx=cvs.getContext('2d'),cx=w/2,cy=h/2;
+  ctx.save(); ctx.clearRect(0,0,w,h);
+  ctx.translate(cx,cy); ctx.rotate(-roll*Math.PI/180);
+  const pitchPx=pitch*2;
+  // Sky
+  ctx.fillStyle='#1a6fb5'; ctx.fillRect(-w,-h/2+pitchPx,w*2,h);
+  // Ground
+  ctx.fillStyle='#7a4a1e'; ctx.fillRect(-w,pitchPx,w*2,h);
+  // Horizon line
+  ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(-w,pitchPx); ctx.lineTo(w,pitchPx); ctx.stroke();
+  // Bank angle ticks
+  [30,60].forEach(a=>{
+    ctx.save(); ctx.rotate(a*Math.PI/180);
+    ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(0,-cy+10); ctx.lineTo(0,-cy+20); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.rotate(-a*Math.PI/180);
+    ctx.beginPath(); ctx.moveTo(0,-cy+10); ctx.lineTo(0,-cy+20); ctx.stroke(); ctx.restore();
+  });
+  ctx.restore();
+  // Center marker
+  ctx.strokeStyle='#FFD34D'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(cx-30,cy); ctx.lineTo(cx-10,cy); ctx.lineTo(cx-10,cy+8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx+30,cy); ctx.lineTo(cx+10,cy); ctx.lineTo(cx+10,cy+8); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,4,0,2*Math.PI); ctx.fillStyle='#FFD34D'; ctx.fill();
+}
+let g_ah_pitch=0,g_ah_roll=0;
+
+function fetchData(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    put('heroAp',yes(d.wifi.ap,'AP Ligado','AP Inativo')); put('heroLan',d.wifi.sta_connected?'WIFI OK @ '+txt(d.wifi.sta_ip):'Sem LAN'); put('heroIp','http://'+txt(d.wifi.ip));
+    put('labBmeState',d.meteo.connected?'Ligado':'Off'); put('labBmeTemp',num(d.meteo.temperature_c,' C')); put('labBmeHum',num(d.meteo.humidity_pct,' %')); put('labBmePress',num(d.meteo.pressure_hpa,' hP')); put('labBmeAlt',num(d.meteo.altitude_m,' m')); put('labBmeNote',txt(d.meteo.summary));
+    put('labGpsState',d.gps.fix?'3D Fix':(d.gps.receiving?'RX...':'Wait')); put('labGpsFix',txt(d.gps.sats)+' sats'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsMotion',num(d.gps.speed_kmh,' km/h')); put('labGpsSentence',txt(d.gps.last_sentence));
+    put('labLoraState',yes(d.lora.enabled,'Sniffer ON','Off')); put('lrRx2',txt(d.lora.rx_bytes)); put('lrTx2',txt(d.lora.tx_bytes)); put('lrMsg2',txt(d.lora.last_message));
+    put('ovPitch',num(d.imu.pitch_deg,' deg')); put('ovRoll',num(d.imu.roll_deg,' deg')); put('mtGas',num(d.meteo.gas_ohms,' OHM')); put('sdLogger',yes(d.blackbox.logging_enabled,'Gravação SD Rec','SD Pausado'));
+    put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsRate',txt(d.gps.update_hz)+' Hz'); put('gpsSentence',txt(d.gps.history).replaceAll('\\n','\n'));
+    if(d.gps.has_location){const lat=d.gps.lat,lon=d.gps.lon;const oe=$('gpsOsmLink');if(oe)oe.href='https://www.openstreetmap.org/?mlat='+lat+'&mlon='+lon+'#map=16/'+lat+'/'+lon;const ge=$('gpsGoogleLink');if(ge)ge.href='https://www.google.com/maps/search/?api=1&query='+lat+','+lon;}
+    if(d.sats_arr){
+      plotSky(d.sats_arr);
+      const total=d.sats_arr.length;
+      const gps=d.sats_arr.filter(s=>s.t==='G').length;
+      const glo=d.sats_arr.filter(s=>s.t==='R').length;
+      const bds=d.sats_arr.filter(s=>s.t==='B').length;
+      const gal=d.sats_arr.filter(s=>s.t==='E').length;
+      put('skpTotal',total+' sats visíveis'); put('skpGps','GPS '+gps); put('skpGlo','GLO '+glo); put('skpBds','BDS '+bds); put('skpGal','GAL '+gal);
+    }
+    put('lrState',yes(d.lora.enabled,'LIGADO','DESLIGADO')); put('lrMsg',txt(d.lora.last_message)); put('lrConsole',txt(d.lora.history).replaceAll('\\n','\n'));
+    put('cmScan',txt(d.sensors.scan)); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); val('cmStaSsid',txt(d.wifi.sta_ssid,''));
+    
+    // Plane (Smoothed) + Artificial Horizon
+    if(d.plane) {
+        put('pltAlt', num(d.plane.avg_altitude_m, ' m'));
+        put('pltVs', num(d.plane.avg_vs_ms, ' m/s'));
+        put('pltSpd', num(d.plane.avg_speed_kmh, ' km/h'));
+    }
+    if(d.imu){
+        const p=d.imu.pitch_deg||0, r=d.imu.roll_deg||0;
+        put('ahPitch', num(p,' °')); put('ahRoll', num(r,' °'));
+        drawAH(p,r);
+    }
+  }).catch(()=>{});
+}
+setTab('lab'); fetchData(); setInterval(fetchData, 1800);
 </script></div></body></html>)SBWEB"));
-  return;
-  client.print(F("HTTP/1.1 200 OK\r\n"));
-  client.print(F("Content-Type: text/html; charset=utf-8\r\n"));
-  client.print(F("Cache-Control: no-store\r\n"));
-  client.print(F("Connection: close\r\n\r\n"));
-  client.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"));
-  client.print(F("<meta name='viewport' content='width=device-width,initial-scale=1'>"));
-  client.print(F("<title>StratosBrain S3</title>"));
-  client.print(F("<style>:root{--bg:#071019;--panel:#0d1823;--panel2:#101f2d;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59;}*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text)}a{color:#8bddff}.wrap{padding:16px;max-width:1180px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:6px 0 8px;font-size:34px}.lead{color:var(--muted);font-size:15px;line-height:1.5}.hero-grid,.grid,.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.hero-grid{margin-top:12px}.mini,.card{background:rgba(7,14,21,.45);border:1px solid rgba(111,214,255,.18);border-radius:16px;padding:14px}.card{background:var(--panel);border-color:#21364a}.mini b,.card h3{display:block;margin:0 0 8px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}.btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.small{padding:8px 12px;font-size:13px}.tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.big.small{font-size:22px}.muted{color:var(--muted);font-size:14px;line-height:1.5}.mono{font-family:Consolas,monospace}.ok{color:var(--ok)}.warnc{color:var(--warn)}.danger{color:var(--danger)}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#123046;border:1px solid #275779;color:#dff6ff;font-size:12px;font-weight:700}.footer{margin-top:14px;color:var(--muted);font-size:12px}.kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.span2{grid-column:1/-1}</style></head><body>"));
-  client.print(F("<div class='wrap'><div class='hero'><div class='eyebrow'>StratosBrain S3</div><h1>Lab Web</h1><div class='lead'>Painel de bancada para validar BME688, GPS UART e LoRa UART antes de integrar tudo no cockpit.</div>"));
-  client.print(F("<div class='hero-grid'><div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div><div class='mini'><b>IP / URL</b><span class='mono' id='heroIp'>--</span></div><div class='mini'><b>Tela ativa</b><span id='heroScreen'>--</span></div><div class='mini'><b>Modo</b><span id='heroMode'>--</span></div></div>"));
-  client.print(F("<div class='actions'><button class='btn alt' onclick=\"act('wifi=toggle')\">Wi-Fi on/off</button><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('rescan=1')\">Rescan</button><button class='btn small' onclick=\"act('lora_tx=ping')\">LoRa PING</button></div></div>"));
-  client.print(F("<div class='tabs'><button class='btn tab active' data-tab='lab' onclick=\"setTab('lab')\">Lab</button><button class='btn tab' data-tab='meteo' onclick=\"setTab('meteo')\">Meteo</button><button class='btn tab' data-tab='comms' onclick=\"setTab('comms')\">Comms</button><button class='btn tab' data-tab='lora' onclick=\"setTab('lora')\">LoRa</button><button class='btn tab' data-tab='config' onclick=\"setTab('config')\">Config</button><button class='btn tab' data-tab='overview' onclick=\"setTab('overview')\">Overview</button></div>"));
-  client.print(F("<section class='section active' id='section-lab'><div class='split'>"));
-  client.print(F("<div class='card'><h3>BME688</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Endereco: <span class='mono' id='labBmeAddr'>--</span><br>Temp: <span id='labBmeTemp'>--</span><br>Umidade: <span id='labBmeHum'>--</span><br>Pressao: <span id='labBmePress'>--</span><br>Altitude: <span id='labBmeAlt'>--</span><br>Gas: <span id='labBmeGas'>--</span><br>Nota: <span id='labBmeNote'>--</span></div><div class='actions'><button class='btn small' onclick=\"act('screen=meteo')\">Abrir METEO</button><button class='btn small' onclick=\"act('rescan=1')\">Atualizar I2C</button></div></div>"));
-  client.print(F("<div class='card'><h3>GPS UART</h3><div class='big' id='labGpsState'>--</div><div class='muted'>UART: <span class='mono' id='labGpsUart'>RX43 / TX44</span><br>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Alt/Vel: <span id='labGpsMotion'>--</span><br>Ultima NMEA: <span class='mono' id='labGpsSentence'>--</span><br>Nota: <span id='labGpsNote'>--</span></div><div class='actions'><button class='btn small' onclick=\"act('screen=comms')\">Abrir COMMS</button></div></div>"));
-  client.print(F("<div class='card'><h3>LoRa UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>Pinos: <span class='mono' id='labLoraPins'>TX17 RX18 AUX6 M0/1 7/8</span><br>AUX: <span id='labLoraAux'>--</span><br>RX/TX bytes: <span id='labLoraTraffic'>--</span><br>Ultima msg: <span class='mono' id='labLoraMsg'>--</span><br>Nota: <span id='labLoraNote'>--</span></div><div class='actions'><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('lora_tx=ping')\">Enviar PING</button><button class='btn small' onclick=\"act('screen=lora')\">Abrir LORA</button></div></div>"));
-  client.print(F("</div></section>"));
-  client.print(F("<section class='section' id='section-meteo'><div class='split'><div class='card'><h3>Clima</h3><div class='big' id='mtTheme'>--</div><div class='muted' id='mtSummary'>--</div></div><div class='card'><h3>Altitude</h3><div class='big' id='mtAlt'>--</div><div class='muted'>estimada pela pressao do BME688</div></div><div class='card'><h3>Pressao</h3><div class='big' id='mtPress'>--</div><div class='muted'>leitura barometrica</div></div><div class='card'><h3>Temperatura</h3><div class='big' id='mtTemp'>--</div><div class='muted'>ambiente local</div></div><div class='card'><h3>Umidade</h3><div class='big' id='mtHum'>--</div><div class='muted'>umidade relativa</div></div></div></section>"));
-  client.print(F("<section class='section' id='section-comms'><div class='split'><div class='card'><h3>Rede</h3><div class='muted'>SSID: <span class='mono' id='cmSsid'>--</span><br>Senha: <span class='mono' id='cmPass'>--</span><br>IP: <span class='mono' id='cmIp'>--</span><br>Clientes: <span id='cmClients'>--</span><br>Hits web: <span id='cmHits'>--</span><br>Nota: <span id='cmNote'>--</span></div></div><div class='card'><h3>Mapa de integracao</h3><div class='muted'>Sensores: <span id='cmSensors'>--</span><br>Rotas: <span id='cmRoutes'>--</span><br>Scan I2C: <span class='mono' id='cmScan'>--</span><br>GPS: <span id='cmGps'>--</span><br>LoRa: <span id='cmLora'>--</span></div></div></div></section>"));
-  client.print(F("<section class='section' id='section-lora'><div class='split'><div class='card'><h3>Estado LoRa</h3><div class='big' id='lrState'>--</div><div class='muted'>UART: <span class='mono' id='lrBus'>--</span><br>AUX: <span id='lrAux'>--</span><br>RX bytes: <span id='lrRx'>--</span><br>TX bytes: <span id='lrTx'>--</span><br>Ultimo RX: <span id='lrLastRx'>--</span><br>Ultimo TX: <span id='lrLastTx'>--</span></div></div><div class='card'><h3>Teste rapido</h3><div class='muted'>Use o PING para validar envio pelo modulo serial. Se houver outra ponta ouvindo, ela deve receber o payload.</div><div class='actions'><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('lora_tx=ping')\">Enviar PING</button><button class='btn small' onclick=\"act('lora_tx=status')\">Enviar STATUS?</button></div><div class='footer' id='lrPlan'>--</div></div></div></section>"));
-  client.print(F("<section class='section' id='section-config'><div class='split'><div class='card'><h3>Config</h3><div class='muted'>Tela ativa: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Orientacao: <span id='cfOrientation'>--</span><br>Rotacao: <span id='cfRotation'>--</span><br>Logger: <span id='cfLogger'>--</span><br>Ultima escrita: <span id='cfLastLog'>--</span></div><div class='actions'><button class='btn small' onclick=\"act('screen=config')\">Abrir CONFIG</button><button class='btn small' onclick=\"act('logger=toggle')\">Pausar logger</button></div></div><div class='card'><h3>SD e sensores</h3><div class='muted'>Arquivo: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Nota SD: <span id='cfNote'>--</span><br>Sensores: <span id='cfSensors'>--</span><br>Scan I2C: <span class='mono' id='cfScan'>--</span></div></div></div></section>"));
-  client.print(F("<section class='section' id='section-overview'><div class='grid'><div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes: <span id='ovClients'>--</span></div></div><div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div><div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div><div class='card'><h3>Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div></div></section>"));
-  client.print(F("<script>const $=i=>document.getElementById(i);const put=(i,v)=>{const e=$(i);if(e)e.textContent=v;};const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s;const txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v;const yes=(v,a='ON',b='OFF')=>v?a:b;function setTab(n){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}function act(q){fetch('/api/action?'+q,{cache:'no-store'}).then(()=>setTimeout(refresh,220)).catch(()=>setTimeout(refresh,600));}function fmtMs(v){return(v===undefined||v===null||v===0)?'--':String(v)+' ms';}function refresh(){fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{put('heroAp',yes(d.wifi.ap,'AP ativo','AP offline'));put('heroIp','http://'+txt(d.wifi.ip));put('heroScreen',txt(d.screen_label));put('heroMode',d.runtime_light?'modo leve':'cockpit completo');put('labBmeState',d.meteo.connected?'BME OK':'BME OFF');put('labBmeAddr',d.sensors.scan.includes('0x77')?'0x77':(d.sensors.scan.includes('0x76')?'0x76':'--'));put('labBmeTemp',num(d.meteo.temperature_c,' C'));put('labBmeHum',num(d.meteo.humidity_pct,' %'));put('labBmePress',num(d.meteo.pressure_hpa,' hPa'));put('labBmeAlt',num(d.meteo.altitude_m,' m'));put('labBmeGas',num(d.meteo.gas_ohms,' ohms'));put('labBmeNote',txt(d.meteo.summary));put('labGpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'NMEA RX':'GPS aguardando'));put('labGpsFix',d.gps.fix?('OK / '+txt(d.gps.sats)+' sats'):'sem fix');put('labGpsSats',txt(d.gps.sats));put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--');put('labGpsMotion',num(d.gps.alt_m,' m')+' / '+num(d.gps.speed_kmh,' km/h'));put('labGpsSentence',txt(d.gps.last_sentence));put('labGpsNote',txt(d.gps.note));put('labLoraState',d.lora.enabled?(d.lora.receiving?'RX ativo':'LoRa ON'):'LoRa OFF');put('labLoraAux',yes(d.lora.aux_high,'HIGH','LOW'));put('labLoraTraffic',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes));put('labLoraMsg',txt(d.lora.last_message));put('labLoraNote',txt(d.lora.note));put('mtTheme',txt(d.meteo.theme));put('mtSummary',txt(d.meteo.summary));put('mtTemp',num(d.meteo.temperature_c,' C'));put('mtHum',num(d.meteo.humidity_pct,' %'));put('mtPress',num(d.meteo.pressure_hpa,' hPa'));put('mtAlt',num(d.meteo.altitude_m,' m'));put('cmSsid',txt(d.wifi.ssid));put('cmPass',txt(d.wifi.password));put('cmIp',txt(d.wifi.ip));put('cmClients',txt(d.wifi.clients));put('cmHits',txt(d.wifi.web_hits));put('cmNote',txt(d.wifi.note));put('cmSensors',txt(d.sensors.summary));put('cmRoutes',txt(d.sensors.routes));put('cmScan',txt(d.sensors.scan));put('cmGps',d.gps.fix?('fix OK / '+txt(d.gps.sats)+' sats'):(d.gps.receiving?'recebendo NMEA':'sem trafego'));put('cmLora',d.lora.enabled?('ON / AUX '+yes(d.lora.aux_high,'HIGH','LOW')):'OFF');put('lrState',yes(d.lora.enabled,'ligado','desligado'));put('lrBus','UART TX17 RX18 | AUX6 | M0/1 7/8');put('lrAux',yes(d.lora.aux_high,'HIGH','LOW'));put('lrRx',txt(d.lora.rx_bytes));put('lrTx',txt(d.lora.tx_bytes));put('lrLastRx',fmtMs(d.lora.last_rx_ms));put('lrLastTx',fmtMs(d.lora.last_tx_ms));put('lrPlan',txt(d.lora.note));put('cfScreen',txt(d.screen_label));put('cfMode',d.runtime_light?'leve':'normal');put('cfOrientation',txt(d.ui.orientation));put('cfRotation',txt(d.ui.rotation));put('cfLogger',yes(d.blackbox.logging_enabled,'ligado','pausado'));put('cfLastLog',fmtMs(d.blackbox.last_log_ms));put('cfFile',txt(d.blackbox.file));put('cfRecords',txt(d.blackbox.records));put('cfNote',txt(d.blackbox.note));put('cfSensors',txt(d.sensors.known));put('cfScan',txt(d.sensors.scan));put('ovUptime',num(d.uptime_s,' s'));put('ovHits',txt(d.wifi.web_hits));put('ovClients',txt(d.wifi.clients));put('ovImu',d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF');put('ovPitch',num(d.imu.pitch_deg,' deg'));put('ovRoll',num(d.imu.roll_deg,' deg'));put('ovTemp',num(d.imu.temperature_c,' C'));put('ovTouch',yes(d.touch.pressed,'ON','OFF'));put('ovTouchXY',txt(d.touch.x)+','+txt(d.touch.y));put('ovTouchCount',txt(d.touch.count));put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao'));put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado'));put('ovFile',txt(d.blackbox.file));put('ovRecords',txt(d.blackbox.records));}).catch(()=>{});}setTab('lab');refresh();setInterval(refresh,1800);</script>"));
-  client.print(F("</div></body></html>"));
 }
 
 static void handleWifiPortal()
@@ -3200,6 +3312,30 @@ static void handleWifiPortal()
     sendHttpJsonStatus(client);
   } else if (strncmp(request_path, "/api/status", 11) == 0) {
     sendHttpJsonStatus(client);
+  } else if (strncmp(request_path, "/api/scan", 9) == 0) {
+    // WiFi scan: bloqueia por ~3s mas retorna lista de redes
+    client.print(F("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"));
+    const int n = WiFi.scanNetworks(false, false);
+    client.print(F("{\"networks\":["));
+    if (n > 0) {
+      for (int i = 0; i < n; i++) {
+        char ssid_esc[66] = {};
+        const String &raw = WiFi.SSID(i);
+        size_t eo = 0;
+        for (size_t si = 0; si < raw.length() && eo < 63; si++) {
+          char c = raw[si];
+          if (c == '"' || c == '\\') { ssid_esc[eo++] = '\\'; }
+          if (eo < 63) ssid_esc[eo++] = c;
+        }
+        client.printf("{\"ssid\":\"%s\",\"rssi\":%d,\"enc\":%s}%s",
+          ssid_esc,
+          WiFi.RSSI(i),
+          WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false",
+          (i < n - 1) ? "," : "");
+      }
+      WiFi.scanDelete();
+    }
+    client.print(F("]}"));
   } else {
     sendHttpDashboard(client);
   }
@@ -4267,6 +4403,9 @@ static void imuTask(void *parameter)
       roll_deg = -roll_deg;
     }
 
+    if (fabsf(pitch_deg) < 0.6f) pitch_deg = 0.0f;
+    if (fabsf(roll_deg) < 0.6f) roll_deg = 0.0f;
+
     state.pitch_deg = clampFloat(pitch_deg, -89.0f, 89.0f);
     state.roll_deg = clampFloat(roll_deg, -180.0f, 180.0f);
     state.temperature_c = sample.temperature_c;
@@ -5054,12 +5193,6 @@ static void createEfisScreen()
   lv_obj_set_style_text_color(g_lbl_efis_status, lv_color_hex(0xE7EDF5), 0);
   lv_obj_align(g_lbl_efis_status, LV_ALIGN_TOP_LEFT, 0, 28);
 
-  g_lbl_plane_skydive = lv_label_create(summary_panel);
-  lv_label_set_text(g_lbl_plane_skydive, "SKYDIVE: aguardando altimetro");
-  lv_label_set_long_mode(g_lbl_plane_skydive, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(g_lbl_plane_skydive, screen_w - 40);
-  lv_obj_set_style_text_color(g_lbl_plane_skydive, lv_color_hex(0xFFCF8A), 0);
-  lv_obj_align(g_lbl_plane_skydive, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
   lv_obj_t *info_panel = lv_obj_create(g_screen_efis);
   lv_obj_clear_flag(info_panel, LV_OBJ_FLAG_SCROLLABLE);
@@ -5075,8 +5208,8 @@ static void createEfisScreen()
   const lv_coord_t half_w = (plane_panel_w - 8) / 2;
   const lv_coord_t card_h = (info_h - 26) / 2;
   const lv_coord_t row2_y = card_h + 8;
-  createDataCard(info_panel, half_w, card_h, LV_ALIGN_TOP_LEFT, 0, 0, 0xFFD34D, "ALT", "---- ft", &g_lbl_plane_altitude);
-  createDataCard(info_panel, half_w, card_h, LV_ALIGN_TOP_RIGHT, 0, 0, 0x45D1FF, "V/S", "---- fpm", &g_lbl_plane_vario);
+  createDataCard(info_panel, half_w, card_h, LV_ALIGN_TOP_LEFT, 0, 0, 0xFFD34D, "ALT", "---- m", &g_lbl_plane_altitude);
+  createDataCard(info_panel, half_w, card_h, LV_ALIGN_TOP_RIGHT, 0, 0, 0x45D1FF, "V/S", "---- m/s", &g_lbl_plane_vario);
   createDataCard(info_panel, half_w, card_h, LV_ALIGN_TOP_LEFT, 0, row2_y, 0x53C2A3, "HDG", "--- dg", &g_lbl_plane_heading);
   createDataCard(info_panel, half_w, card_h, LV_ALIGN_TOP_RIGHT, 0, row2_y, 0xFFB357, "SPD", "-- km/h", &g_lbl_plane_speed);
 
@@ -6021,11 +6154,11 @@ static void refreshEfisUI()
   }
 
   if (g_lbl_plane_altitude) {
-    lv_label_set_text(g_lbl_plane_altitude, "---- ft");
+    lv_label_set_text_fmt(g_lbl_plane_altitude, "%.1f m", g_plane_smooth_alt);
   }
 
   if (g_lbl_plane_vario) {
-    lv_label_set_text(g_lbl_plane_vario, "---- fpm");
+    lv_label_set_text_fmt(g_lbl_plane_vario, "%+.1f m/s", g_plane_smooth_vs);
   }
 
   if (g_lbl_plane_heading) {
@@ -6033,21 +6166,9 @@ static void refreshEfisUI()
   }
 
   if (g_lbl_plane_speed) {
-    if (gps.receiving || gps.has_fix) {
-      lv_label_set_text_fmt(g_lbl_plane_speed, "%.1f km/h", gps.speed_kmh);
-    } else {
-      lv_label_set_text(g_lbl_plane_speed, "-- km/h");
-    }
+    lv_label_set_text_fmt(g_lbl_plane_speed, "%.1f km/h", g_plane_smooth_spd);
   }
 
-  if (g_lbl_plane_skydive) {
-    lv_label_set_text_fmt(
-        g_lbl_plane_skydive,
-        "BMP581 %s | BMM350 %s | GPS %s",
-        bmp_ok ? "OK" : "--",
-        bmm_ok ? "OK" : "--",
-        gps.receiving ? (gps.has_fix ? "FIX" : "RX") : "--");
-  }
 
   if (g_lbl_efis_status) {
     if (!imu.connected) {
@@ -6714,6 +6835,29 @@ void loop()
     const Bme688State bme = copyBme688State();
     const GpsState gps = copyGpsState();
     const LoraState lora = copyLoraState();
+
+    if (g_plane_last_update_ms == 0) {
+      g_plane_smooth_alt = gps.altitude_m;
+      g_plane_smooth_spd = gps.speed_kmh;
+      g_plane_last_update_ms = now;
+    } else {
+      float dt = (now - g_plane_last_update_ms) / 1000.0f;
+      g_plane_last_update_ms = now;
+      float alt_sum = 0;
+      int alt_c = 0;
+      if (bme.connected && bme.has_data) { alt_sum += bme.altitude_m; alt_c++; }
+      if (gps.has_fix) { alt_sum += gps.altitude_m; alt_c++; }
+      float raw_alt = alt_c > 0 ? (alt_sum / alt_c) : g_plane_smooth_alt;
+      float raw_spd = gps.has_fix ? gps.speed_kmh : g_plane_smooth_spd;
+      
+      if (dt > 0.0f) {
+        float alt_diff = raw_alt - g_plane_smooth_alt;
+        float current_vs = alt_diff / dt;
+        g_plane_smooth_vs = (current_vs * 0.15f) + (g_plane_smooth_vs * 0.85f);
+        g_plane_smooth_alt = (raw_alt * 0.2f) + (g_plane_smooth_alt * 0.8f);
+        g_plane_smooth_spd = (raw_spd * 0.2f) + (g_plane_smooth_spd * 0.8f);
+      }
+    }
 
     if (g_lbl_uptime) {
       lv_label_set_text_fmt(g_lbl_uptime, "Uptime: %lus", now / 1000UL);
