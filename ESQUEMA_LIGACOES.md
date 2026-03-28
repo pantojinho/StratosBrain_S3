@@ -34,8 +34,8 @@ Uso:
 
 ### UART do GPS
 
-- `ESP RX = GPIO43`
-- `ESP TX = GPIO44`
+- `ESP RX = GPIO1`
+- `ESP TX = GPIO2`
 
 ### UART do LoRa
 
@@ -146,8 +146,8 @@ Existem dois cenarios:
 
 - `VCC -> 3V3`
 - `GND -> GND`
-- `TX do GPS -> GPIO43 (RX do ESP)`
-- `RX do GPS -> GPIO44 (TX do ESP)`
+- `TX do GPS -> GPIO1 (RX do ESP)`
+- `RX do GPS -> GPIO2 (TX do ESP)`
 
 ### GPS breakout/adaptador 5V
 
@@ -155,8 +155,8 @@ Se for aquela placa adaptadora do anuncio com `VCC = 5V`:
 
 - `VCC -> 5V`
 - `GND -> GND`
-- `TXD do GPS -> GPIO43 (TX do ESP)`
-- `RXD do GPS -> GPIO44 (RX do ESP)`
+- `TXD do GPS -> GPIO1 (RX do ESP)`
+- `RXD do GPS -> GPIO2 (TX do ESP)`
 
 Observacao:
 
@@ -269,7 +269,7 @@ Ligacao compartilhada:
 | BME688 | I2C | `47/48` | `0x76` ou `0x77` |
 | BMP581 | I2C | `47/48` | `0x46` ou `0x47` |
 | BMM350 | I2C | `47/48` | `0x14` |
-| GPS | UART | `43/44` | nao usa I2C |
+| GPS | UART | `1/2` | nao usa I2C |
 | LoRa UART | UART | `17/18/6/7/8` | nao usa I2C |
 | microSD | SPI | `38/39/40/41` | nao usa I2C |
 
@@ -290,7 +290,7 @@ Ligacao compartilhada:
 Ja preparado para:
 
 - `BME688` com leitura basica
-- `GPS` reservado em `43/44`
+- `GPS` reservado em `1/2`
 - `LoRa UART` reservado em `17/18/6/7/8`
 - `LORA` menu dedicado
 
