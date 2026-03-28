@@ -21,6 +21,7 @@
 #include <math.h>
 #include <string.h>
 #include <Arduino_GFX_Library.h>
+#include <bme68xLibrary.h>
 #include <esp32-hal-rgb-led.h>
 #include <esp_heap_caps.h>
 #include <esp_err.h>
@@ -45,6 +46,15 @@ static constexpr int I2C_SDA = 47;
 static constexpr int I2C_SCL = 48;
 static constexpr int BOOT_BUTTON_PIN = 0;
 static constexpr int RGB_LED_PIN = 45;
+static constexpr int GPS_UART_TX_PIN = 44;
+static constexpr int GPS_UART_RX_PIN = 43;
+static constexpr uint32_t GPS_UART_BAUD = 9600UL;
+static constexpr int LORA_UART_TX_PIN = 17;
+static constexpr int LORA_UART_RX_PIN = 18;
+static constexpr int LORA_AUX_PIN = 6;
+static constexpr int LORA_M0_PIN = 7;
+static constexpr int LORA_M1_PIN = 8;
+static constexpr uint32_t LORA_UART_BAUD = 9600UL;
 
 static constexpr int SDCARD_CS_PIN = 38;
 static constexpr int SDCARD_MOSI_PIN = 39;
@@ -95,6 +105,14 @@ static constexpr uint16_t EFIS_HORIZON_H = 220;
 static constexpr size_t EFIS_HORIZON_PIXELS = EFIS_HORIZON_W * EFIS_HORIZON_H;
 static constexpr float DEG_TO_RAD_F = 0.01745329252f;
 static constexpr float RAD_TO_DEG_F = 57.2957795f;
+static constexpr uint8_t BME688_ADDR_PRIMARY = 0x77;
+static constexpr uint8_t BME688_ADDR_SECONDARY = 0x76;
+static constexpr uint16_t BME688_HEATER_TEMP_C = 300;
+static constexpr uint16_t BME688_HEATER_TIME_MS = 100;
+static constexpr uint32_t BME688_POLL_PERIOD_MS = 2000U;
+static constexpr uint32_t GPS_STALE_MS = 4000U;
+static constexpr uint32_t LORA_STALE_MS = 4000U;
+static constexpr float STANDARD_SEA_LEVEL_HPA = 1013.25f;
 
 static constexpr bool IMU_SWAP_XY = false;
 static constexpr bool IMU_INVERT_X = false;
@@ -102,6 +120,14 @@ static constexpr bool IMU_INVERT_Y = false;
 static constexpr bool IMU_INVERT_Z = false;
 static constexpr bool IMU_INVERT_PITCH_SIGN = false;
 static constexpr bool IMU_INVERT_ROLL_SIGN = true;
+
+enum MeteoThemeMode : uint8_t
+{
+  METEO_THEME_OPEN = 0,
+  METEO_THEME_CLOUDY = 1,
+  METEO_THEME_RAIN = 2,
+  METEO_THEME_WAITING = 3
+};
 
 static constexpr uint16_t COLOR_BLACK = 0x0000;
 static constexpr uint16_t COLOR_WHITE = 0xFFFF;
@@ -119,6 +145,10 @@ static constexpr uint32_t BLACKBOX_LOG_PERIOD_MS = 1000U;
 static constexpr uint32_t BLACKBOX_MOUNT_RETRY_MS = 3000U;
 static constexpr uint32_t BLACKBOX_FLUSH_PERIOD_MS = 5000U;
 static constexpr uint32_t SD_PURGE_CONFIRM_MS = 8000U;
+static constexpr uint8_t BLACKBOX_TAIL_LINE_COUNT = 5;
+static constexpr size_t BLACKBOX_TAIL_LINE_LEN = 220;
+static constexpr uint8_t LORA_HISTORY_LINE_COUNT = 16;
+static constexpr size_t LORA_HISTORY_LINE_LEN = 140;
 static constexpr uint32_t BOOT_BUTTON_GUARD_MS = 2500U;
 static constexpr uint32_t BOOT_BUTTON_DEBOUNCE_MS = 40U;
 static constexpr uint32_t BOOT_BUTTON_SHORT_PRESS_MS = 700U;
@@ -134,6 +164,10 @@ static constexpr uint32_t WIFI_STATUS_SERIAL_MS = 15000U;
 static constexpr bool ENABLE_AUTO_ROTATION_UI = false;
 static constexpr uint16_t WIFI_WEB_PORT = 80;
 static constexpr uint32_t WIFI_CLIENT_TIMEOUT_MS = 350U;
+static constexpr size_t WIFI_STA_SSID_LEN = 33;
+static constexpr size_t WIFI_STA_PASSWORD_LEN = 65;
+static constexpr char WIFI_STA_DEFAULT_SSID[] = "";
+static constexpr char WIFI_STA_DEFAULT_PASSWORD[] = "";
 
 static Arduino_DataBus *g_bus = nullptr;
 static Arduino_CO5300 *g_panel = nullptr;
@@ -149,6 +183,7 @@ static lv_obj_t *g_screen_main = nullptr;
 static lv_obj_t *g_screen_efis = nullptr;
 static lv_obj_t *g_screen_meteo = nullptr;
 static lv_obj_t *g_screen_gps = nullptr;
+static lv_obj_t *g_screen_lora = nullptr;
 static lv_obj_t *g_screen_config = nullptr;
 
 enum AppScreenId
@@ -157,6 +192,7 @@ enum AppScreenId
   SCREEN_EFIS,
   SCREEN_METEO,
   SCREEN_GPS,
+  SCREEN_LORA,
   SCREEN_CONFIG
 };
 
@@ -181,8 +217,15 @@ static lv_obj_t *g_lbl_plane_vario = nullptr;
 static lv_obj_t *g_lbl_plane_heading = nullptr;
 static lv_obj_t *g_lbl_plane_speed = nullptr;
 static lv_obj_t *g_lbl_plane_skydive = nullptr;
+static lv_obj_t *g_meteo_hero = nullptr;
+static lv_obj_t *g_meteo_panel = nullptr;
 static lv_obj_t *g_lbl_meteo_theme = nullptr;
+static lv_obj_t *g_lbl_meteo_status = nullptr;
 static lv_obj_t *g_lbl_meteo_cards = nullptr;
+static lv_obj_t *g_lbl_meteo_altitude = nullptr;
+static lv_obj_t *g_lbl_meteo_pressure = nullptr;
+static lv_obj_t *g_lbl_meteo_temperature = nullptr;
+static lv_obj_t *g_lbl_meteo_humidity = nullptr;
 static lv_obj_t *g_lbl_comms_status = nullptr;
 static lv_obj_t *g_lbl_comms_wifi = nullptr;
 static lv_obj_t *g_lbl_comms_ble = nullptr;
@@ -192,6 +235,10 @@ static lv_obj_t *g_lbl_comms_mode = nullptr;
 static lv_obj_t *g_lbl_comms_wifi_btn = nullptr;
 static lv_obj_t *g_lbl_comms_lora_btn = nullptr;
 static lv_obj_t *g_lbl_comms_rescan_btn = nullptr;
+static lv_obj_t *g_lbl_lora_status = nullptr;
+static lv_obj_t *g_lbl_lora_radio = nullptr;
+static lv_obj_t *g_lbl_lora_test = nullptr;
+static lv_obj_t *g_lbl_lora_toggle_btn = nullptr;
 static lv_obj_t *g_lbl_home_hint = nullptr;
 static lv_obj_t *g_lbl_config_orientation = nullptr;
 static lv_obj_t *g_lbl_config_rotation = nullptr;
@@ -205,6 +252,8 @@ static lv_obj_t *g_lbl_config_blackbox_btn = nullptr;
 static lv_obj_t *g_lbl_config_format_btn = nullptr;
 static lv_obj_t *g_lbl_config_wifi_btn = nullptr;
 static lv_obj_t *g_lbl_config_lora_btn = nullptr;
+static lv_obj_t *g_lbl_config_brightness = nullptr;
+static lv_obj_t *g_lbl_config_cdc = nullptr;
 
 static uint16_t g_touch_x = 0;
 static uint16_t g_touch_y = 0;
@@ -228,6 +277,8 @@ static String g_sensor_summary_cache;
 static String g_sensor_raw_scan_cache;
 static String g_sensor_compact_cache;
 static String g_sensor_scan_compact_cache;
+static String g_sensor_bosch_cache;
+static String g_sensor_route_cache;
 static uint16_t g_efis_horizon_w = EFIS_HORIZON_W;
 static uint16_t g_efis_horizon_h = EFIS_HORIZON_H;
 static float g_pitch_trim_deg = 0.0f;
@@ -241,25 +292,50 @@ static uint32_t g_sd_purge_arm_ms = 0;
 static SPIClass g_sd_spi(HSPI);
 static File g_blackbox_file;
 static IPAddress g_wifi_ap_ip(0, 0, 0, 0);
+static IPAddress g_wifi_sta_ip(0, 0, 0, 0);
 static esp_netif_t *g_wifi_ap_netif = nullptr;
+static esp_netif_t *g_wifi_sta_netif = nullptr;
 static NetworkServer g_web_server(WIFI_WEB_PORT);
 static bool g_wifi_stack_ready = false;
 static bool g_wifi_ap_started = false;
+static bool g_wifi_sta_started = false;
+static bool g_wifi_sta_connected = false;
 static bool g_wifi_web_started = false;
+static bool g_wifi_events_registered = false;
 static uint32_t g_wifi_web_hits = 0;
 static uint32_t g_wifi_last_client_ms = 0;
 static uint32_t g_wifi_last_status_ms = 0;
+static uint32_t g_wifi_recover_request_ms = 0;
 static bool g_wifi_mode_requested = false;
+static bool g_wifi_ap_requested = false;
+static bool g_wifi_sta_requested = false;
+static bool g_wifi_apply_pending = false;
 static bool g_lora_enabled = false;
+static bool g_lora_uart_ready = false;
+static bool g_gps_uart_ready = false;
 static bool g_runtime_services_light = false;
 static char g_wifi_diag_note[BLACKBOX_NOTE_LEN] = "AP desligado. Ligue em COMMS ou CONFIG.";
+static char g_wifi_sta_ssid[WIFI_STA_SSID_LEN] = "";
+static char g_wifi_sta_password[WIFI_STA_PASSWORD_LEN] = "";
+static char g_wifi_sta_note[BLACKBOX_NOTE_LEN] = "LAN desligada";
+static char g_blackbox_tail_lines[BLACKBOX_TAIL_LINE_COUNT][BLACKBOX_TAIL_LINE_LEN] = {};
+static uint8_t g_blackbox_tail_count = 0;
+static uint8_t g_blackbox_tail_head = 0;
+static char g_lora_history_lines[LORA_HISTORY_LINE_COUNT][LORA_HISTORY_LINE_LEN] = {};
+static uint8_t g_lora_history_count = 0;
+static uint8_t g_lora_history_head = 0;
 static float g_efis_display_pitch_deg = 0.0f;
 static float g_efis_display_roll_deg = 0.0f;
 static bool g_efis_display_seeded = false;
+static uint8_t g_display_brightness = 255;
 static bool g_boot_button_last_raw_pressed = false;
 static bool g_boot_button_stable_pressed = false;
 static uint32_t g_boot_button_last_change_ms = 0;
 static uint32_t g_boot_button_press_ms = 0;
+static char g_gps_line_buffer[128] = {};
+static size_t g_gps_line_len = 0;
+static char g_lora_line_buffer[128] = {};
+static size_t g_lora_line_len = 0;
 
 struct ImuState
 {
@@ -295,10 +371,69 @@ struct BlackboxState
   char note[BLACKBOX_NOTE_LEN];
 };
 
+struct Bme688State
+{
+  bool connected;
+  bool initialized;
+  bool reading_ok;
+  bool has_data;
+  uint8_t i2c_addr;
+  float temperature_c;
+  float humidity_pct;
+  float pressure_hpa;
+  float altitude_m;
+  float gas_ohms;
+  uint32_t last_update_ms;
+  char note[80];
+};
+
+struct GpsState
+{
+  bool uart_ready;
+  bool receiving;
+  bool has_fix;
+  bool has_location;
+  bool sentence_seen;
+  uint8_t sats;
+  uint32_t rx_bytes;
+  uint32_t line_count;
+  uint32_t last_rx_ms;
+  uint32_t last_fix_ms;
+  float latitude_deg;
+  float longitude_deg;
+  float altitude_m;
+  float speed_kmh;
+  char last_sentence[96];
+  char note[96];
+};
+
+struct LoraState
+{
+  bool uart_ready;
+  bool enabled;
+  bool aux_high;
+  bool receiving;
+  uint32_t rx_bytes;
+  uint32_t tx_bytes;
+  uint32_t last_rx_ms;
+  uint32_t last_tx_ms;
+  char last_message[96];
+  char note[96];
+};
+
 static portMUX_TYPE g_imu_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_blackbox_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_bme688_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_gps_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_lora_mux = portMUX_INITIALIZER_UNLOCKED;
 static ImuState g_imu_state = {};
 static BlackboxState g_blackbox_state = {};
+static Bme68x g_bme688;
+static Bme688State g_bme688_state = {};
+static GpsState g_gps_state = {};
+static LoraState g_lora_state = {};
+static uint8_t g_bme688_addr = 0;
+static bool g_bme688_initialized = false;
 static String scanI2C();
 static const IPAddress WIFI_AP_LOCAL_IP(192, 168, 4, 1);
 static const IPAddress WIFI_AP_GATEWAY(192, 168, 4, 1);
@@ -362,6 +497,654 @@ static BlackboxState copyBlackboxState()
   portEXIT_CRITICAL(&g_blackbox_mux);
 
   return snapshot;
+}
+
+static void storeBme688State(const Bme688State &state)
+{
+  portENTER_CRITICAL(&g_bme688_mux);
+  g_bme688_state = state;
+  portEXIT_CRITICAL(&g_bme688_mux);
+}
+
+static Bme688State copyBme688State()
+{
+  Bme688State snapshot;
+
+  portENTER_CRITICAL(&g_bme688_mux);
+  snapshot = g_bme688_state;
+  portEXIT_CRITICAL(&g_bme688_mux);
+
+  return snapshot;
+}
+
+static void storeGpsState(const GpsState &state)
+{
+  portENTER_CRITICAL(&g_gps_mux);
+  g_gps_state = state;
+  portEXIT_CRITICAL(&g_gps_mux);
+}
+
+static GpsState copyGpsState()
+{
+  GpsState snapshot;
+
+  portENTER_CRITICAL(&g_gps_mux);
+  snapshot = g_gps_state;
+  portEXIT_CRITICAL(&g_gps_mux);
+
+  return snapshot;
+}
+
+static void storeLoraState(const LoraState &state)
+{
+  portENTER_CRITICAL(&g_lora_mux);
+  g_lora_state = state;
+  portEXIT_CRITICAL(&g_lora_mux);
+}
+
+static LoraState copyLoraState()
+{
+  LoraState snapshot;
+
+  portENTER_CRITICAL(&g_lora_mux);
+  snapshot = g_lora_state;
+  portEXIT_CRITICAL(&g_lora_mux);
+
+  return snapshot;
+}
+
+static void clearBlackboxTail()
+{
+  portENTER_CRITICAL(&g_blackbox_mux);
+  g_blackbox_tail_count = 0;
+  g_blackbox_tail_head = 0;
+  for (uint8_t i = 0; i < BLACKBOX_TAIL_LINE_COUNT; ++i) {
+    g_blackbox_tail_lines[i][0] = '\0';
+  }
+  portEXIT_CRITICAL(&g_blackbox_mux);
+}
+
+static void appendBlackboxTailLine(const char *line)
+{
+  if (!line || !line[0]) {
+    return;
+  }
+
+  char clean_line[BLACKBOX_TAIL_LINE_LEN];
+  snprintf(clean_line, sizeof(clean_line), "%s", line);
+  size_t len = strlen(clean_line);
+  while (len > 0 && (clean_line[len - 1] == '\r' || clean_line[len - 1] == '\n')) {
+    clean_line[--len] = '\0';
+  }
+
+  portENTER_CRITICAL(&g_blackbox_mux);
+  snprintf(
+      g_blackbox_tail_lines[g_blackbox_tail_head],
+      BLACKBOX_TAIL_LINE_LEN,
+      "%s",
+      clean_line);
+  g_blackbox_tail_head = static_cast<uint8_t>((g_blackbox_tail_head + 1U) % BLACKBOX_TAIL_LINE_COUNT);
+  if (g_blackbox_tail_count < BLACKBOX_TAIL_LINE_COUNT) {
+    g_blackbox_tail_count += 1U;
+  }
+  portEXIT_CRITICAL(&g_blackbox_mux);
+}
+
+static void formatBlackboxTailJson(char *buffer, size_t buffer_len)
+{
+  if (!buffer || buffer_len == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  size_t out = 0;
+
+  portENTER_CRITICAL(&g_blackbox_mux);
+  const uint8_t count = g_blackbox_tail_count;
+  const uint8_t head = g_blackbox_tail_head;
+
+  for (uint8_t i = 0; i < count && out < (buffer_len - 1U); ++i) {
+    const uint8_t index = static_cast<uint8_t>((head + BLACKBOX_TAIL_LINE_COUNT - count + i) % BLACKBOX_TAIL_LINE_COUNT);
+    const char *line = g_blackbox_tail_lines[index];
+    for (size_t j = 0; line[j] != '\0' && out < (buffer_len - 1U); ++j) {
+      char c = line[j];
+      if (c == '"' || c == '\\') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = c;
+      } else if (c == '\r' || c == '\n') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = 'n';
+      } else if (c < 32) {
+        buffer[out++] = ' ';
+      } else {
+        buffer[out++] = c;
+      }
+    }
+
+    if (i + 1U < count && out + 2U < buffer_len) {
+      buffer[out++] = '\\';
+      buffer[out++] = 'n';
+    }
+  }
+  portEXIT_CRITICAL(&g_blackbox_mux);
+
+  buffer[out] = '\0';
+}
+
+static void clearLoraHistory()
+{
+  portENTER_CRITICAL(&g_lora_mux);
+  g_lora_history_count = 0;
+  g_lora_history_head = 0;
+  for (uint8_t i = 0; i < LORA_HISTORY_LINE_COUNT; ++i) {
+    g_lora_history_lines[i][0] = '\0';
+  }
+  portEXIT_CRITICAL(&g_lora_mux);
+}
+
+static void appendLoraHistoryLine(const char *direction, const char *payload)
+{
+  if ((!direction || !direction[0]) && (!payload || !payload[0])) {
+    return;
+  }
+
+  char line[LORA_HISTORY_LINE_LEN];
+  snprintf(
+      line,
+      sizeof(line),
+      "%s | %s",
+      (direction && direction[0]) ? direction : "?",
+      (payload && payload[0]) ? payload : "-");
+
+  size_t len = strlen(line);
+  while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
+    line[--len] = '\0';
+  }
+
+  portENTER_CRITICAL(&g_lora_mux);
+  snprintf(
+      g_lora_history_lines[g_lora_history_head],
+      LORA_HISTORY_LINE_LEN,
+      "%s",
+      line);
+  g_lora_history_head = static_cast<uint8_t>((g_lora_history_head + 1U) % LORA_HISTORY_LINE_COUNT);
+  if (g_lora_history_count < LORA_HISTORY_LINE_COUNT) {
+    g_lora_history_count += 1U;
+  }
+  portEXIT_CRITICAL(&g_lora_mux);
+}
+
+static void formatLoraHistoryJson(char *buffer, size_t buffer_len)
+{
+  if (!buffer || buffer_len == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  size_t out = 0;
+
+  portENTER_CRITICAL(&g_lora_mux);
+  const uint8_t count = g_lora_history_count;
+  const uint8_t head = g_lora_history_head;
+
+  for (uint8_t i = 0; i < count && out < (buffer_len - 1U); ++i) {
+    const uint8_t index = static_cast<uint8_t>((head + LORA_HISTORY_LINE_COUNT - count + i) % LORA_HISTORY_LINE_COUNT);
+    const char *line = g_lora_history_lines[index];
+    for (size_t j = 0; line[j] != '\0' && out < (buffer_len - 1U); ++j) {
+      const char c = line[j];
+      if (c == '"' || c == '\\') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = c;
+      } else if (c == '\r' || c == '\n') {
+        if (out + 2U >= buffer_len) {
+          break;
+        }
+        buffer[out++] = '\\';
+        buffer[out++] = 'n';
+      } else if (c < 32) {
+        buffer[out++] = ' ';
+      } else {
+        buffer[out++] = c;
+      }
+    }
+
+    if (i + 1U < count && out + 2U < buffer_len) {
+      buffer[out++] = '\\';
+      buffer[out++] = 'n';
+    }
+  }
+  portEXIT_CRITICAL(&g_lora_mux);
+
+  buffer[out] = '\0';
+}
+
+static bool ipAddressValid(const IPAddress &ip)
+{
+  return ip != IPAddress(0, 0, 0, 0);
+}
+
+static void updateWifiRequestedFlag()
+{
+  g_wifi_mode_requested = g_wifi_ap_requested || g_wifi_sta_requested;
+}
+
+static float pressureToAltitudeMeters(float pressure_hpa, float sea_level_hpa = STANDARD_SEA_LEVEL_HPA)
+{
+  if (pressure_hpa <= 0.0f || sea_level_hpa <= 0.0f) {
+    return 0.0f;
+  }
+
+  return 44330.0f * (1.0f - powf(pressure_hpa / sea_level_hpa, 0.1903f));
+}
+
+static uint8_t classifyMeteoTheme(const Bme688State &bme, char *theme_out, size_t theme_len, char *summary_out, size_t summary_len)
+{
+  auto setTexts = [&](const char *theme, const char *summary, uint8_t mode) -> uint8_t {
+    if (theme_out && theme_len > 0) {
+      snprintf(theme_out, theme_len, "%s", theme ? theme : "");
+    }
+    if (summary_out && summary_len > 0) {
+      snprintf(summary_out, summary_len, "%s", summary ? summary : "");
+    }
+    return mode;
+  };
+
+  if (!bme.connected || !bme.has_data) {
+    return setTexts(
+        "AGUARDANDO",
+        "Sem leitura valida do BME688. Assim que houver dados, o sistema estima aberto, nublado ou chuva provavel.",
+        METEO_THEME_WAITING);
+  }
+
+  const float pressure = bme.pressure_hpa;
+  const float humidity = bme.humidity_pct;
+
+  if (pressure <= 1006.0f || (pressure <= 1009.0f && humidity >= 82.0f)) {
+    return setTexts(
+        "CHUVA PROVAVEL",
+        "Pressao baixa e umidade alta sugerem instabilidade e chance maior de chuva.",
+        METEO_THEME_RAIN);
+  }
+
+  if (pressure >= 1018.0f && humidity <= 65.0f) {
+    return setTexts(
+        "ABERTO",
+        "Pressao alta e ar mais seco sugerem tempo firme e ceu mais aberto.",
+        METEO_THEME_OPEN);
+  }
+
+  if (pressure >= 1014.0f && humidity <= 75.0f) {
+    return setTexts(
+        "ABERTO",
+        "Pressao acima da media e umidade moderada sugerem tempo mais estavel.",
+        METEO_THEME_OPEN);
+  }
+
+  return setTexts(
+      "NUBLADO",
+      "Umidade elevada ou pressao mais baixa sugerem mais nuvens e mudanca de tempo.",
+      METEO_THEME_CLOUDY);
+}
+
+static float parseNmeaCoordinate(const char *value, const char hemisphere)
+{
+  if (!value || !value[0]) {
+    return NAN;
+  }
+
+  const float raw = atof(value);
+  if (raw == 0.0f) {
+    return 0.0f;
+  }
+
+  const char *dot = strchr(value, '.');
+  const size_t whole_digits = dot ? static_cast<size_t>(dot - value) : strlen(value);
+  const size_t degree_digits = whole_digits > 4 ? 3 : 2;
+  if (whole_digits <= degree_digits) {
+    return NAN;
+  }
+
+  char degrees_text[4] = {};
+  memcpy(degrees_text, value, degree_digits);
+  const float degrees = static_cast<float>(atoi(degrees_text));
+  const float minutes = atof(value + degree_digits);
+  float coordinate = degrees + (minutes / 60.0f);
+  if (hemisphere == 'S' || hemisphere == 'W') {
+    coordinate = -coordinate;
+  }
+  return coordinate;
+}
+
+static void finalizeGpsSentence(char *sentence)
+{
+  if (!sentence || sentence[0] == '\0' || sentence[0] != '$') {
+    return;
+  }
+
+  GpsState state = copyGpsState();
+  const uint32_t now = millis();
+  state.uart_ready = g_gps_uart_ready;
+  state.sentence_seen = true;
+  state.line_count += 1U;
+  state.last_rx_ms = now;
+  snprintf(state.last_sentence, sizeof(state.last_sentence), "%s", sentence);
+
+  char work[128];
+  snprintf(work, sizeof(work), "%s", sentence);
+  char *checksum = strchr(work, '*');
+  if (checksum) {
+    *checksum = '\0';
+  }
+
+  char *save = nullptr;
+  char *fields[20] = {};
+  size_t field_count = 0;
+  char *token = strtok_r(work, ",", &save);
+  while (token && field_count < 20) {
+    fields[field_count++] = token;
+    token = strtok_r(nullptr, ",", &save);
+  }
+
+  if (field_count == 0 || !fields[0]) {
+    storeGpsState(state);
+    return;
+  }
+
+  const bool is_gga = strstr(fields[0], "GGA") != nullptr;
+  const bool is_rmc = strstr(fields[0], "RMC") != nullptr;
+
+  if (is_gga && field_count >= 10) {
+    const int fix_quality = fields[6] ? atoi(fields[6]) : 0;
+    const uint8_t sats = fields[7] ? static_cast<uint8_t>(atoi(fields[7])) : 0U;
+    const float lat = parseNmeaCoordinate(fields[2], fields[3] ? fields[3][0] : 'N');
+    const float lon = parseNmeaCoordinate(fields[4], fields[5] ? fields[5][0] : 'E');
+    const float alt_m = fields[9] ? atof(fields[9]) : 0.0f;
+    state.sats = sats;
+    if (!isnan(lat) && !isnan(lon)) {
+      state.latitude_deg = lat;
+      state.longitude_deg = lon;
+      state.has_location = true;
+    }
+    state.altitude_m = alt_m;
+    state.has_fix = fix_quality > 0;
+    if (state.has_fix) {
+      state.last_fix_ms = now;
+    }
+  } else if (is_rmc && field_count >= 8) {
+    const bool valid = fields[2] && fields[2][0] == 'A';
+    const float lat = parseNmeaCoordinate(fields[3], fields[4] ? fields[4][0] : 'N');
+    const float lon = parseNmeaCoordinate(fields[5], fields[6] ? fields[6][0] : 'E');
+    const float speed_knots = fields[7] ? atof(fields[7]) : 0.0f;
+    if (!isnan(lat) && !isnan(lon)) {
+      state.latitude_deg = lat;
+      state.longitude_deg = lon;
+      state.has_location = true;
+    }
+    state.speed_kmh = speed_knots * 1.852f;
+    if (valid) {
+      state.has_fix = true;
+      state.last_fix_ms = now;
+    }
+  }
+
+  state.receiving = true;
+  if (state.has_fix) {
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        "Fix OK | %u sats | %.5f %.5f",
+        static_cast<unsigned>(state.sats),
+        state.latitude_deg,
+        state.longitude_deg);
+  } else {
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        "NMEA RX | linhas %lu | aguardando fix",
+        static_cast<unsigned long>(state.line_count));
+  }
+  storeGpsState(state);
+}
+
+static void pollGpsUart()
+{
+  GpsState state = copyGpsState();
+  const uint32_t now = millis();
+  state.uart_ready = g_gps_uart_ready;
+
+  while (g_gps_uart_ready && Serial1.available() > 0) {
+    const int raw = Serial1.read();
+    if (raw < 0) {
+      break;
+    }
+
+    const char c = static_cast<char>(raw);
+    state.rx_bytes += 1U;
+    state.last_rx_ms = now;
+    state.receiving = true;
+
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      if (g_gps_line_len > 0) {
+        g_gps_line_buffer[g_gps_line_len] = '\0';
+        finalizeGpsSentence(g_gps_line_buffer);
+        g_gps_line_len = 0;
+        g_gps_line_buffer[0] = '\0';
+        state = copyGpsState();
+      }
+      continue;
+    }
+
+    if (g_gps_line_len < (sizeof(g_gps_line_buffer) - 1U)) {
+      g_gps_line_buffer[g_gps_line_len++] = c;
+    } else {
+      g_gps_line_buffer[g_gps_line_len] = '\0';
+      finalizeGpsSentence(g_gps_line_buffer);
+      g_gps_line_len = 0;
+      g_gps_line_buffer[0] = '\0';
+      state = copyGpsState();
+    }
+  }
+
+  state.receiving = state.uart_ready && state.rx_bytes > 0U && (now - state.last_rx_ms) < GPS_STALE_MS;
+  if (!state.uart_ready) {
+    snprintf(state.note, sizeof(state.note), "UART GPS indisponivel");
+  } else if (!state.receiving && !state.sentence_seen) {
+    snprintf(state.note, sizeof(state.note), "UART pronta | sem trafego NMEA");
+  } else if (!state.has_fix && state.receiving) {
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        "Recebendo NMEA | linhas %lu | fix pendente",
+        static_cast<unsigned long>(state.line_count));
+  } else if (!state.receiving && state.sentence_seen && !state.has_fix) {
+    snprintf(state.note, sizeof(state.note), "Sem trafego recente | ultimo fix pendente");
+  }
+  storeGpsState(state);
+}
+
+static void finalizeLoraMessage(char *message)
+{
+  if (!message || message[0] == '\0') {
+    return;
+  }
+
+  LoraState state = copyLoraState();
+  state.receiving = true;
+  snprintf(state.last_message, sizeof(state.last_message), "%s", message);
+  snprintf(state.note, sizeof(state.note), "RX %lu bytes | ultima msg pronta", static_cast<unsigned long>(state.rx_bytes));
+  storeLoraState(state);
+  appendLoraHistoryLine("RX", message);
+  Serial.printf("[LORA] RX: %s\n", message);
+}
+
+static void pollLoraUart()
+{
+  LoraState state = copyLoraState();
+  const uint32_t now = millis();
+  state.uart_ready = g_lora_uart_ready;
+  state.enabled = g_lora_enabled;
+  state.aux_high = g_lora_uart_ready ? (digitalRead(LORA_AUX_PIN) == HIGH) : false;
+
+  while (g_lora_uart_ready && Serial2.available() > 0) {
+    const int raw = Serial2.read();
+    if (raw < 0) {
+      break;
+    }
+
+    const char c = static_cast<char>(raw);
+    state.rx_bytes += 1U;
+    state.last_rx_ms = now;
+    state.receiving = true;
+
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      if (g_lora_line_len > 0) {
+        g_lora_line_buffer[g_lora_line_len] = '\0';
+        finalizeLoraMessage(g_lora_line_buffer);
+        g_lora_line_len = 0;
+        g_lora_line_buffer[0] = '\0';
+        state = copyLoraState();
+      }
+      continue;
+    }
+
+    const char safe_char = (c >= 32 && c <= 126) ? c : '.';
+    if (g_lora_line_len < (sizeof(g_lora_line_buffer) - 1U)) {
+      g_lora_line_buffer[g_lora_line_len++] = safe_char;
+    } else {
+      g_lora_line_buffer[g_lora_line_len] = '\0';
+      finalizeLoraMessage(g_lora_line_buffer);
+      g_lora_line_len = 0;
+      g_lora_line_buffer[0] = '\0';
+      state = copyLoraState();
+    }
+  }
+
+  if (g_lora_line_len > 0 && state.last_rx_ms > 0 && (now - state.last_rx_ms) > 120U) {
+    g_lora_line_buffer[g_lora_line_len] = '\0';
+    finalizeLoraMessage(g_lora_line_buffer);
+    g_lora_line_len = 0;
+    g_lora_line_buffer[0] = '\0';
+    state = copyLoraState();
+  }
+
+  state.receiving = state.uart_ready && state.rx_bytes > 0U && (now - state.last_rx_ms) < LORA_STALE_MS;
+  if (!state.uart_ready) {
+    snprintf(state.note, sizeof(state.note), "UART LoRa indisponivel");
+  } else if (!state.enabled) {
+    snprintf(state.note, sizeof(state.note), "LoRa desligado");
+  } else if (state.receiving) {
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        "LoRa RX ativo | AUX %s | %lu bytes",
+        state.aux_high ? "HIGH" : "LOW",
+        static_cast<unsigned long>(state.rx_bytes));
+  } else {
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        "LoRa pronto | AUX %s | sem trafego",
+        state.aux_high ? "HIGH" : "LOW");
+  }
+  storeLoraState(state);
+}
+
+static void requestLoraTestSend(const char *payload, const char *origin)
+{
+  if (!payload || !payload[0]) {
+    return;
+  }
+
+  LoraState state = copyLoraState();
+  if (!g_lora_uart_ready || !g_lora_enabled) {
+    snprintf(state.note, sizeof(state.note), "Envio bloqueado: LoRa OFF");
+    storeLoraState(state);
+    Serial.printf("[LORA] Envio ignorado via %s: modulo OFF\n", origin ? origin : "sistema");
+    return;
+  }
+
+  Serial2.print(payload);
+  Serial2.print("\r\n");
+  state.tx_bytes += static_cast<uint32_t>(strlen(payload) + 2U);
+  state.last_tx_ms = millis();
+  snprintf(state.last_message, sizeof(state.last_message), "TX: %s", payload);
+  snprintf(
+      state.note,
+      sizeof(state.note),
+      "TX %lu bytes | ultima carga: %s",
+      static_cast<unsigned long>(state.tx_bytes),
+      payload);
+  storeLoraState(state);
+  appendLoraHistoryLine("TX", payload);
+  Serial.printf("[LORA] Envio via %s: %s\n", origin ? origin : "sistema", payload);
+}
+
+static void requestLoraTelemetrySend(const char *mode, const char *origin)
+{
+  char payload[160];
+  payload[0] = '\0';
+
+  if (mode && strcmp(mode, "meteo") == 0) {
+    const Bme688State bme = copyBme688State();
+    if (!bme.connected || !bme.has_data) {
+      requestLoraTestSend("METEO:SEM_DADOS", origin);
+      return;
+    }
+
+    snprintf(
+        payload,
+        sizeof(payload),
+        "METEO,T=%.1f,H=%.1f,P=%.1f,ALT=%.1f",
+        bme.temperature_c,
+        bme.humidity_pct,
+        bme.pressure_hpa,
+        bme.altitude_m);
+  } else if (mode && strcmp(mode, "gps") == 0) {
+    const GpsState gps = copyGpsState();
+    if (!gps.receiving) {
+      requestLoraTestSend("GPS:SEM_TRAFEGO", origin);
+      return;
+    }
+
+    if (!gps.has_location) {
+      snprintf(
+          payload,
+          sizeof(payload),
+          "GPS,NMEA,sats=%u,fix=%u",
+          static_cast<unsigned>(gps.sats),
+          gps.has_fix ? 1U : 0U);
+    } else {
+      snprintf(
+          payload,
+          sizeof(payload),
+          "GPS,fix=%u,sats=%u,lat=%.5f,lon=%.5f,alt=%.1f,spd=%.1f",
+          gps.has_fix ? 1U : 0U,
+          static_cast<unsigned>(gps.sats),
+          gps.latitude_deg,
+          gps.longitude_deg,
+          gps.altitude_m,
+          gps.speed_kmh);
+    }
+  }
+
+  if (payload[0]) {
+    requestLoraTestSend(payload, origin);
+  }
 }
 
 static void setImuTrim(float pitch_trim_deg, float roll_trim_deg)
@@ -438,6 +1221,25 @@ static const char *rotationLabel(lv_display_rotation_t rotation)
   }
 }
 
+static uint8_t clampBrightness(int value)
+{
+  if (value < 24) {
+    return 24;
+  }
+  if (value > 255) {
+    return 255;
+  }
+  return static_cast<uint8_t>(value);
+}
+
+static void applyPanelBrightness(uint8_t value)
+{
+  g_display_brightness = clampBrightness(value);
+  if (g_panel) {
+    g_panel->setBrightness(g_display_brightness);
+  }
+}
+
 static const char *cardTypeLabel(sdcard_type_t card_type)
 {
   switch (card_type) {
@@ -509,10 +1311,30 @@ static const char *wifiStateLabel()
     return "ativo";
   }
 
-  if (g_wifi_mode_requested) {
+  if (g_wifi_ap_requested) {
     return "subindo";
   }
 
+  return "off";
+}
+
+static const char *wifiModeLabel()
+{
+  if (g_wifi_ap_started && g_wifi_sta_connected) {
+    return "AP+LAN";
+  }
+  if (g_wifi_ap_started && g_wifi_sta_requested) {
+    return "AP+STA";
+  }
+  if (g_wifi_ap_started) {
+    return "AP";
+  }
+  if (g_wifi_sta_connected) {
+    return "LAN";
+  }
+  if (g_wifi_sta_requested) {
+    return "STA";
+  }
   return "off";
 }
 
@@ -530,9 +1352,9 @@ static uint16_t wifiClientCount()
   return static_cast<uint16_t>(sta_list.num);
 }
 
-static void formatWifiVisibleIp(char *buffer, size_t buffer_len)
+static void formatWifiApIp(char *buffer, size_t buffer_len)
 {
-  if (g_wifi_ap_started) {
+  if (g_wifi_ap_started && ipAddressValid(g_wifi_ap_ip)) {
     formatIpAddress(g_wifi_ap_ip, buffer, buffer_len);
     return;
   }
@@ -540,11 +1362,35 @@ static void formatWifiVisibleIp(char *buffer, size_t buffer_len)
   formatIpAddress(WIFI_AP_LOCAL_IP, buffer, buffer_len);
 }
 
+static void formatWifiStaIp(char *buffer, size_t buffer_len)
+{
+  if (g_wifi_sta_connected && ipAddressValid(g_wifi_sta_ip)) {
+    formatIpAddress(g_wifi_sta_ip, buffer, buffer_len);
+    return;
+  }
+
+  snprintf(buffer, buffer_len, "--");
+}
+
+static void formatWifiVisibleIp(char *buffer, size_t buffer_len)
+{
+  if (g_wifi_sta_connected && ipAddressValid(g_wifi_sta_ip)) {
+    formatIpAddress(g_wifi_sta_ip, buffer, buffer_len);
+    return;
+  }
+
+  formatWifiApIp(buffer, buffer_len);
+}
+
 static void printWifiStatus(const char *reason)
 {
   char ip_text[20];
+  char ap_ip_text[20];
+  char sta_ip_text[20];
   char mac_text[24];
   formatWifiVisibleIp(ip_text, sizeof(ip_text));
+  formatWifiApIp(ap_ip_text, sizeof(ap_ip_text));
+  formatWifiStaIp(sta_ip_text, sizeof(sta_ip_text));
   wifi_mode_t mode = WIFI_MODE_NULL;
   uint8_t mac[6] = {0};
   esp_wifi_get_mode(&mode);
@@ -562,16 +1408,20 @@ static void printWifiStatus(const char *reason)
       mac[4],
       mac[5]);
   Serial.printf(
-      "[WIFI] %s | req=%s | ap=%s | mode=%d | ssid=%s | pass=%s | ip=%s | ch=%u | hidden=%u | clients=%u | hits=%lu | mac=%s | heap=%lu | psram=%lu\n",
+      "[WIFI] %s | mode=%s(%d) | req_ap=%s req_sta=%s | ap=%s ip=%s | sta=%s ip=%s ssid=%s | primary=%s | ap_ssid=%s | pass=%s | clients=%u | hits=%lu | mac=%s | heap=%lu | psram=%lu\n",
       reason ? reason : "Status",
-      g_wifi_mode_requested ? "on" : "off",
-      g_wifi_ap_started ? "on" : "off",
+      wifiModeLabel(),
       static_cast<int>(mode),
+      g_wifi_ap_requested ? "on" : "off",
+      g_wifi_sta_requested ? "on" : "off",
+      g_wifi_ap_started ? "on" : "off",
+      ap_ip_text,
+      g_wifi_sta_connected ? "on" : "off",
+      sta_ip_text,
+      g_wifi_sta_ssid[0] ? g_wifi_sta_ssid : "-",
+      ip_text,
       WIFI_AP_SSID,
       WIFI_AP_PASSWORD,
-      ip_text,
-      static_cast<unsigned>(WIFI_AP_CHANNEL),
-      static_cast<unsigned>(WIFI_AP_HIDDEN ? 1 : 0),
       static_cast<unsigned>(wifiClientCount()),
       static_cast<unsigned long>(g_wifi_web_hits),
       mac_text,
@@ -637,7 +1487,7 @@ static void updateWifiLed()
 
 static void updateRuntimeServiceMode()
 {
-  const bool light_mode = g_wifi_mode_requested || g_wifi_ap_started;
+  const bool light_mode = g_wifi_ap_requested || g_wifi_ap_started;
   if (light_mode == g_runtime_services_light) {
     return;
   }
@@ -651,10 +1501,7 @@ static void updateRuntimeServiceMode()
       Serial.println("[BLACKBOX] Logger pausado enquanto Wi-Fi AP estiver ativo");
     }
     g_efis_display_seeded = false;
-    if (g_current_screen_id == SCREEN_METEO) {
-      loadScreenById(SCREEN_GPS);
-    }
-    Serial.println("[MODE] Wi-Fi ativo: cockpit pesado em modo leve");
+    Serial.println("[MODE] Wi-Fi ativo: runtime em modo leve, METEO permanece disponivel");
   } else {
     restoreEfisCanvasBufferIfNeeded();
     if (g_blackbox_resume_after_wifi) {
@@ -664,6 +1511,68 @@ static void updateRuntimeServiceMode()
     }
     Serial.println("[MODE] Wi-Fi desligado: cockpit pesado liberado novamente");
   }
+}
+
+static void onWifiEvent(void *, esp_event_base_t event_base, int32_t event_id, void *)
+{
+  if (event_base != WIFI_EVENT) {
+    return;
+  }
+
+  if (event_id == WIFI_EVENT_STA_START) {
+    if (g_wifi_sta_requested && g_wifi_sta_ssid[0]) {
+      esp_wifi_connect();
+      snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "Conectando em %s...", g_wifi_sta_ssid);
+    }
+  } else if (event_id == WIFI_EVENT_AP_START) {
+    g_wifi_ap_started = true;
+    refreshWifiApIp();
+    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP ativo em http://192.168.4.1");
+    Serial.println("[WIFI] Evento AP_START");
+  } else if (event_id == WIFI_EVENT_AP_STOP) {
+    g_wifi_ap_started = false;
+    g_wifi_web_started = false;
+    if (g_wifi_ap_requested) {
+      g_wifi_apply_pending = true;
+      g_wifi_recover_request_ms = millis();
+      snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP caiu. Tentando recuperar...");
+      Serial.println("[WIFI] Evento AP_STOP, agendando recuperacao");
+    } else {
+      Serial.println("[WIFI] Evento AP_STOP");
+    }
+  } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+    g_wifi_sta_started = true;
+    snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "Associado ao roteador. Aguardando IP...");
+  } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    g_wifi_sta_connected = false;
+    g_wifi_sta_ip = IPAddress(0, 0, 0, 0);
+    if (g_wifi_sta_requested && g_wifi_sta_ssid[0]) {
+      esp_wifi_connect();
+      snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "STA desconectado. Tentando reconectar...");
+    } else {
+      snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN desligada");
+    }
+  }
+}
+
+static void onWifiIpEvent(void *, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+  if (event_base != IP_EVENT || event_id != IP_EVENT_STA_GOT_IP || !event_data) {
+    return;
+  }
+
+  const ip_event_got_ip_t *got_ip = static_cast<const ip_event_got_ip_t *>(event_data);
+  const uint32_t addr = got_ip->ip_info.ip.addr;
+  g_wifi_sta_ip = IPAddress(
+      static_cast<uint8_t>(addr & 0xFF),
+      static_cast<uint8_t>((addr >> 8) & 0xFF),
+      static_cast<uint8_t>((addr >> 16) & 0xFF),
+      static_cast<uint8_t>((addr >> 24) & 0xFF));
+  g_wifi_sta_connected = true;
+  g_wifi_sta_started = true;
+  char ip_text[20];
+  formatIpAddress(g_wifi_sta_ip, ip_text, sizeof(ip_text));
+  snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN OK em http://%s", ip_text);
 }
 
 static bool ensureWifiStack()
@@ -692,6 +1601,14 @@ static bool ensureWifiStack()
     }
   }
 
+  if (!g_wifi_sta_netif) {
+    g_wifi_sta_netif = esp_netif_create_default_wifi_sta();
+    if (!g_wifi_sta_netif) {
+      Serial.println("[WIFI] Falha ao criar esp_netif do STA");
+      return false;
+    }
+  }
+
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   err = esp_wifi_init(&cfg);
   if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) {
@@ -709,6 +1626,22 @@ static bool ensureWifiStack()
   if (err != ESP_OK) {
     Serial.printf("[WIFI] esp_wifi_set_ps falhou: %s\n", esp_err_to_name(err));
     return false;
+  }
+
+  if (!g_wifi_events_registered) {
+    err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, onWifiEvent, nullptr);
+    if (err != ESP_OK) {
+      Serial.printf("[WIFI] Registro do handler WIFI_EVENT falhou: %s\n", esp_err_to_name(err));
+      return false;
+    }
+
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, onWifiIpEvent, nullptr);
+    if (err != ESP_OK) {
+      Serial.printf("[WIFI] Registro do handler IP_EVENT falhou: %s\n", esp_err_to_name(err));
+      return false;
+    }
+
+    g_wifi_events_registered = true;
   }
 
   g_wifi_stack_ready = true;
@@ -737,126 +1670,211 @@ static bool refreshWifiApIp()
   return true;
 }
 
+static bool refreshWifiStaIp()
+{
+  if (!g_wifi_sta_netif) {
+    g_wifi_sta_ip = IPAddress(0, 0, 0, 0);
+    return false;
+  }
+
+  esp_netif_ip_info_t ip_info = {};
+  if (esp_netif_get_ip_info(g_wifi_sta_netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+    g_wifi_sta_ip = IPAddress(0, 0, 0, 0);
+    return false;
+  }
+
+  const uint32_t addr = ip_info.ip.addr;
+  g_wifi_sta_ip = IPAddress(
+      static_cast<uint8_t>(addr & 0xFF),
+      static_cast<uint8_t>((addr >> 8) & 0xFF),
+      static_cast<uint8_t>((addr >> 16) & 0xFF),
+      static_cast<uint8_t>((addr >> 24) & 0xFF));
+  return true;
+}
+
 static void startWifiPortal()
 {
-  if (g_wifi_ap_started) {
-    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP ja ativo em http://192.168.4.1");
-    printWifiStatus("AP ja ativo");
+  updateWifiRequestedFlag();
+  if (!g_wifi_mode_requested) {
+    stopWifiPortal();
     return;
   }
 
-  Serial.println("[WIFI] Iniciando SoftAP...");
+  if (g_wifi_sta_requested && !g_wifi_sta_ssid[0]) {
+    if (!g_wifi_ap_requested) {
+      g_wifi_sta_requested = false;
+      updateWifiRequestedFlag();
+      snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "LAN sem SSID configurado");
+      snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "Defina SSID e senha para a rede local");
+      g_wifi_apply_pending = false;
+      return;
+    }
+    snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN ignorada: sem SSID configurado");
+  }
+
+  Serial.println("[WIFI] Aplicando modo AP/STA...");
   if (!ensureWifiStack()) {
-    g_wifi_mode_requested = false;
+    g_wifi_ap_requested = false;
+    g_wifi_sta_requested = false;
+    updateWifiRequestedFlag();
     snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "Falha no stack Wi-Fi. Veja o serial.");
+    g_wifi_apply_pending = false;
     return;
   }
 
   delay(100);
   esp_wifi_stop();
-  Serial.printf(
-      "[WIFI] Config alvo | SSID: %s | Senha: %s | IP: 192.168.4.1 | Canal: %u\n",
-      WIFI_AP_SSID,
-      WIFI_AP_PASSWORD,
-      static_cast<unsigned>(WIFI_AP_CHANNEL));
+  g_wifi_ap_started = false;
+  g_wifi_sta_started = false;
+  g_wifi_sta_connected = false;
+  g_wifi_web_started = false;
+  g_wifi_ap_ip = IPAddress(0, 0, 0, 0);
+  g_wifi_sta_ip = IPAddress(0, 0, 0, 0);
 
-  esp_netif_ip_info_t ip_info = {};
-  ip_info.ip.addr = static_cast<uint32_t>(WIFI_AP_LOCAL_IP);
-  ip_info.gw.addr = static_cast<uint32_t>(WIFI_AP_GATEWAY);
-  ip_info.netmask.addr = static_cast<uint32_t>(WIFI_AP_SUBNET);
-  esp_netif_dhcps_stop(g_wifi_ap_netif);
-  esp_netif_set_ip_info(g_wifi_ap_netif, &ip_info);
-  esp_netif_dhcps_start(g_wifi_ap_netif);
+  const bool want_ap = g_wifi_ap_requested;
+  const bool want_sta = g_wifi_sta_requested && g_wifi_sta_ssid[0];
+  if (want_ap) {
+    Serial.printf(
+        "[WIFI] AP alvo | SSID: %s | Senha: %s | IP: 192.168.4.1 | Canal: %u\n",
+        WIFI_AP_SSID,
+        WIFI_AP_PASSWORD,
+        static_cast<unsigned>(WIFI_AP_CHANNEL));
+
+    esp_netif_ip_info_t ip_info = {};
+    ip_info.ip.addr = static_cast<uint32_t>(WIFI_AP_LOCAL_IP);
+    ip_info.gw.addr = static_cast<uint32_t>(WIFI_AP_GATEWAY);
+    ip_info.netmask.addr = static_cast<uint32_t>(WIFI_AP_SUBNET);
+    esp_netif_dhcps_stop(g_wifi_ap_netif);
+    esp_netif_set_ip_info(g_wifi_ap_netif, &ip_info);
+    esp_netif_dhcps_start(g_wifi_ap_netif);
+  }
 
   wifi_config_t ap_config = {};
-  strncpy(reinterpret_cast<char *>(ap_config.ap.ssid), WIFI_AP_SSID, sizeof(ap_config.ap.ssid) - 1);
-  ap_config.ap.ssid_len = strlen(WIFI_AP_SSID);
-  strncpy(reinterpret_cast<char *>(ap_config.ap.password), WIFI_AP_PASSWORD, sizeof(ap_config.ap.password) - 1);
-  ap_config.ap.channel = WIFI_AP_CHANNEL;
-  ap_config.ap.max_connection = WIFI_AP_MAX_CONNECTIONS;
-  ap_config.ap.ssid_hidden = WIFI_AP_HIDDEN ? 1 : 0;
-  ap_config.ap.authmode = strlen(WIFI_AP_PASSWORD) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+  if (want_ap) {
+    strncpy(reinterpret_cast<char *>(ap_config.ap.ssid), WIFI_AP_SSID, sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid_len = strlen(WIFI_AP_SSID);
+    strncpy(reinterpret_cast<char *>(ap_config.ap.password), WIFI_AP_PASSWORD, sizeof(ap_config.ap.password) - 1);
+    ap_config.ap.channel = WIFI_AP_CHANNEL;
+    ap_config.ap.max_connection = WIFI_AP_MAX_CONNECTIONS;
+    ap_config.ap.ssid_hidden = WIFI_AP_HIDDEN ? 1 : 0;
+    ap_config.ap.authmode = strlen(WIFI_AP_PASSWORD) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+  }
 
-  esp_err_t err = esp_wifi_set_mode(WIFI_MODE_AP);
-  if (err == ESP_OK) {
+  wifi_config_t sta_config = {};
+  if (want_sta) {
+    strncpy(reinterpret_cast<char *>(sta_config.sta.ssid), g_wifi_sta_ssid, sizeof(sta_config.sta.ssid) - 1);
+    strncpy(reinterpret_cast<char *>(sta_config.sta.password), g_wifi_sta_password, sizeof(sta_config.sta.password) - 1);
+    sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+  }
+
+  const wifi_mode_t mode = want_ap
+                               ? (want_sta ? WIFI_MODE_APSTA : WIFI_MODE_AP)
+                               : WIFI_MODE_STA;
+
+  esp_err_t err = esp_wifi_set_mode(mode);
+  if (err == ESP_OK && want_ap) {
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  }
+  if (err == ESP_OK && want_sta) {
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
   }
   if (err == ESP_OK) {
     err = esp_wifi_start();
+  }
+  if (err == ESP_OK && want_sta) {
+    err = esp_wifi_connect();
   }
   if (err == ESP_OK) {
     err = esp_wifi_set_ps(WIFI_PS_NONE);
   }
 
   if (err != ESP_OK) {
-    g_wifi_mode_requested = false;
     g_wifi_ap_started = false;
+    g_wifi_sta_started = false;
+    g_wifi_sta_connected = false;
     g_wifi_web_started = false;
     updateRuntimeServiceMode();
-    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "Falha ao iniciar AP. Veja o serial.");
-    Serial.printf("[WIFI] Falha ao iniciar SoftAP: %s\n", esp_err_to_name(err));
+    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "Falha ao iniciar Wi-Fi. Veja o serial.");
+    Serial.printf("[WIFI] Falha ao iniciar modo AP/STA: %s\n", esp_err_to_name(err));
+    g_wifi_apply_pending = false;
     printWifiStatus("Falha ao iniciar");
     return;
   }
 
   delay(250);
-  refreshWifiApIp();
-  if (g_wifi_ap_ip == IPAddress(0, 0, 0, 0)) {
-    g_wifi_mode_requested = false;
-    g_wifi_ap_started = false;
-    g_wifi_web_started = false;
-    updateRuntimeServiceMode();
-    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP respondeu sem IP valido.");
-    Serial.println("[WIFI] AP respondeu, mas o IP veio 0.0.0.0");
-    printWifiStatus("AP sem IP");
-    return;
+  if (want_ap) {
+    refreshWifiApIp();
+  }
+  if (want_sta) {
+    refreshWifiStaIp();
   }
 
-  g_wifi_mode_requested = true;
-  g_wifi_ap_started = true;
+  g_wifi_ap_started = want_ap;
+  g_wifi_sta_started = want_sta;
+  updateWifiRequestedFlag();
   g_web_server.begin();
   g_web_server.setNoDelay(true);
   g_wifi_web_started = true;
   g_wifi_last_status_ms = millis();
   updateRuntimeServiceMode();
 
-  char ip_text[20];
-  formatWifiVisibleIp(ip_text, sizeof(ip_text));
-  snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP ativo em http://%s", ip_text);
-  Serial.printf(
-      "[WIFI] AP ativo | SSID: %s | Senha: %s | IP: %s | URL: http://%s\n",
-      WIFI_AP_SSID,
-      WIFI_AP_PASSWORD,
-      ip_text,
-      ip_text);
-  printWifiStatus("AP ativo");
+  char ap_ip_text[20];
+  char sta_ip_text[20];
+  formatWifiApIp(ap_ip_text, sizeof(ap_ip_text));
+  formatWifiStaIp(sta_ip_text, sizeof(sta_ip_text));
+  if (want_ap && want_sta) {
+    snprintf(
+        g_wifi_diag_note,
+        sizeof(g_wifi_diag_note),
+        "AP em http://%s | LAN %s",
+        ap_ip_text,
+        g_wifi_sta_connected ? sta_ip_text : "conectando");
+  } else if (want_ap) {
+    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP ativo em http://%s", ap_ip_text);
+  } else {
+    snprintf(
+        g_wifi_diag_note,
+        sizeof(g_wifi_diag_note),
+        g_wifi_sta_connected ? "LAN ativa em http://%s" : "LAN conectando em %s",
+        g_wifi_sta_connected ? sta_ip_text : g_wifi_sta_ssid);
+  }
+  printWifiStatus("Wi-Fi ativo");
+  g_wifi_apply_pending = false;
 }
 
 static void stopWifiPortal()
 {
-  g_wifi_mode_requested = false;
-
   wifi_mode_t mode = WIFI_MODE_NULL;
   esp_wifi_get_mode(&mode);
-  if (!g_wifi_ap_started && !g_wifi_web_started && mode == WIFI_MODE_NULL) {
+  if (!g_wifi_ap_started && !g_wifi_sta_started && !g_wifi_web_started && mode == WIFI_MODE_NULL) {
     updateRuntimeServiceMode();
-    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP desligado. Ligue em COMMS ou CONFIG.");
+    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "Wi-Fi desligado. Ligue em COMMS ou CONFIG.");
     return;
   }
 
-  Serial.println("[WIFI] Desligando SoftAP...");
+  Serial.println("[WIFI] Desligando radio/AP/STA...");
+  g_wifi_ap_requested = false;
+  g_wifi_sta_requested = false;
+  updateWifiRequestedFlag();
   g_web_server.stop();
   esp_wifi_stop();
   esp_wifi_set_mode(WIFI_MODE_NULL);
   g_wifi_ap_started = false;
+  g_wifi_sta_started = false;
+  g_wifi_sta_connected = false;
   g_wifi_web_started = false;
   g_wifi_ap_ip = IPAddress(0, 0, 0, 0);
+  g_wifi_sta_ip = IPAddress(0, 0, 0, 0);
   g_wifi_web_hits = 0;
   g_wifi_last_client_ms = 0;
   g_wifi_last_status_ms = 0;
   updateRuntimeServiceMode();
-  snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "AP desligado. Cockpit completo liberado.");
-  printWifiStatus("AP desligado");
+  snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "Wi-Fi desligado. Cockpit completo liberado.");
+  snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN desligada");
+  g_wifi_apply_pending = false;
+  printWifiStatus("Wi-Fi desligado");
 }
 
 static bool readHttpRequestLine(NetworkClient &client, char *buffer, size_t buffer_len)
@@ -947,6 +1965,8 @@ static const char *screenIdSlug(AppScreenId screen_id)
       return "meteo";
     case SCREEN_GPS:
       return "comms";
+    case SCREEN_LORA:
+      return "lora";
     case SCREEN_CONFIG:
       return "config";
     default:
@@ -963,6 +1983,8 @@ static const char *screenIdLabel(AppScreenId screen_id)
       return "METEO";
     case SCREEN_GPS:
       return "COMMS";
+    case SCREEN_LORA:
+      return "LORA";
     case SCREEN_CONFIG:
       return "CONFIG";
     default:
@@ -997,6 +2019,53 @@ static bool parseHttpPath(const char *request_line, char *path_out, size_t path_
   return true;
 }
 
+static int hexNibble(char c)
+{
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'A' && c <= 'F') {
+    return 10 + (c - 'A');
+  }
+  if (c >= 'a' && c <= 'f') {
+    return 10 + (c - 'a');
+  }
+  return -1;
+}
+
+static void urlDecodeInPlace(char *text)
+{
+  if (!text) {
+    return;
+  }
+
+  size_t read_idx = 0;
+  size_t write_idx = 0;
+  while (text[read_idx] != '\0') {
+    char c = text[read_idx];
+    if (c == '+') {
+      text[write_idx++] = ' ';
+      read_idx += 1;
+      continue;
+    }
+
+    if (c == '%' && text[read_idx + 1] != '\0' && text[read_idx + 2] != '\0') {
+      const int hi = hexNibble(text[read_idx + 1]);
+      const int lo = hexNibble(text[read_idx + 2]);
+      if (hi >= 0 && lo >= 0) {
+        text[write_idx++] = static_cast<char>((hi << 4) | lo);
+        read_idx += 3;
+        continue;
+      }
+    }
+
+    text[write_idx++] = c;
+    read_idx += 1;
+  }
+
+  text[write_idx] = '\0';
+}
+
 static bool httpQueryValue(const char *path, const char *key, char *value_out, size_t value_out_len)
 {
   if (!path || !key || !value_out || value_out_len == 0) {
@@ -1024,6 +2093,7 @@ static bool httpQueryValue(const char *path, const char *key, char *value_out, s
       }
       memcpy(value_out, eq + 1, value_len);
       value_out[value_len] = '\0';
+      urlDecodeInPlace(value_out);
       return true;
     }
 
@@ -1058,6 +2128,10 @@ static bool parseScreenIdFromSlug(const char *slug, AppScreenId *screen_out)
     *screen_out = SCREEN_GPS;
     return true;
   }
+  if (strcmp(slug, "lora") == 0) {
+    *screen_out = SCREEN_LORA;
+    return true;
+  }
   if (strcmp(slug, "config") == 0) {
     *screen_out = SCREEN_CONFIG;
     return true;
@@ -1068,18 +2142,59 @@ static bool parseScreenIdFromSlug(const char *slug, AppScreenId *screen_out)
 
 static void requestWifiMode(bool enable, const char *origin)
 {
-  g_wifi_mode_requested = enable;
+  g_wifi_ap_requested = enable;
   if (enable) {
     g_sd_purge_armed = false;
   }
 
+  updateWifiRequestedFlag();
+  g_wifi_apply_pending = true;
   Serial.printf("[WIFI] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
   updateRuntimeServiceMode();
+}
+
+static void requestWifiStaMode(bool enable, const char *origin)
+{
+  g_wifi_sta_requested = enable;
+  updateWifiRequestedFlag();
+  g_wifi_apply_pending = true;
+  Serial.printf("[WIFI] STA via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
+  updateRuntimeServiceMode();
+}
+
+static void requestWifiStaCredentials(const char *ssid, const char *password, const char *origin)
+{
+  if (ssid) {
+    snprintf(g_wifi_sta_ssid, sizeof(g_wifi_sta_ssid), "%s", ssid);
+  }
+  if (password) {
+    snprintf(g_wifi_sta_password, sizeof(g_wifi_sta_password), "%s", password);
+  }
+
+  if (g_wifi_sta_ssid[0]) {
+    snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "Credenciais LAN prontas para %s", g_wifi_sta_ssid);
+  } else {
+    snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "SSID LAN limpo");
+  }
+  Serial.printf("[WIFI] Credenciais STA atualizadas via %s | SSID=%s\n", origin ? origin : "sistema", g_wifi_sta_ssid[0] ? g_wifi_sta_ssid : "-");
 }
 
 static void requestLoraMode(bool enable, const char *origin)
 {
   g_lora_enabled = enable;
+  if (g_lora_uart_ready) {
+    digitalWrite(LORA_M0_PIN, LOW);
+    digitalWrite(LORA_M1_PIN, LOW);
+  }
+  LoraState state = copyLoraState();
+  state.enabled = enable;
+  state.uart_ready = g_lora_uart_ready;
+  state.aux_high = g_lora_uart_ready ? (digitalRead(LORA_AUX_PIN) == HIGH) : false;
+  snprintf(
+      state.note,
+      sizeof(state.note),
+      enable ? "LoRa habilitado | aguardando trafego" : "LoRa desabilitado");
+  storeLoraState(state);
   Serial.printf("[LORA] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
 }
 
@@ -1109,12 +2224,6 @@ static void requestEfisLevelSet(const char *origin)
 
 static void requestScreenLoad(AppScreenId screen_id, const char *origin)
 {
-  if (g_runtime_services_light && screen_id == SCREEN_METEO) {
-    Serial.printf("[MODE] %s pediu METEO completo; desligando Wi-Fi antes de trocar.\n", origin ? origin : "sistema");
-    g_wifi_mode_requested = false;
-    stopWifiPortal();
-  }
-
   if (g_current_screen_id != screen_id) {
     loadScreenById(screen_id);
     Serial.printf("[UI] Tela alterada via %s para %s\n", origin ? origin : "sistema", screenIdLabel(screen_id));
@@ -1127,7 +2236,14 @@ static void handleHttpActionPath(const char *path)
     return;
   }
 
-  char value[24];
+  char value[96];
+  char sta_ssid[WIFI_STA_SSID_LEN];
+  char sta_pass[WIFI_STA_PASSWORD_LEN];
+  const bool has_sta_ssid = httpQueryValue(path, "sta_ssid", sta_ssid, sizeof(sta_ssid));
+  const bool has_sta_pass = httpQueryValue(path, "sta_pass", sta_pass, sizeof(sta_pass));
+  if (has_sta_ssid || has_sta_pass) {
+    requestWifiStaCredentials(has_sta_ssid ? sta_ssid : nullptr, has_sta_pass ? sta_pass : nullptr, "web");
+  }
 
   if (httpQueryValue(path, "screen", value, sizeof(value))) {
     AppScreenId screen_id = SCREEN_HOME;
@@ -1142,7 +2258,20 @@ static void handleHttpActionPath(const char *path)
     } else if (strcmp(value, "off") == 0) {
       requestWifiMode(false, "web");
     } else if (strcmp(value, "toggle") == 0) {
-      requestWifiMode(!g_wifi_mode_requested, "web");
+      requestWifiMode(!g_wifi_ap_requested, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "sta", value, sizeof(value))) {
+    if (strcmp(value, "on") == 0) {
+      requestWifiStaMode(true, "web");
+    } else if (strcmp(value, "off") == 0) {
+      requestWifiStaMode(false, "web");
+    } else if (strcmp(value, "toggle") == 0) {
+      requestWifiStaMode(!g_wifi_sta_requested, "web");
+    } else if (strcmp(value, "forget") == 0) {
+      requestWifiStaCredentials("", "", "web");
+      requestWifiStaMode(false, "web");
     }
   }
 
@@ -1153,6 +2282,32 @@ static void handleHttpActionPath(const char *path)
       requestLoraMode(false, "web");
     } else if (strcmp(value, "toggle") == 0) {
       requestLoraMode(!g_lora_enabled, "web");
+    }
+  }
+
+  if (httpQueryValue(path, "lora_tx", value, sizeof(value))) {
+    if (strcmp(value, "ping") == 0) {
+      requestLoraTestSend("PING STRATOSBRAIN", "web");
+    } else if (strcmp(value, "status") == 0) {
+      requestLoraTestSend("STATUS?", "web");
+    } else if (strcmp(value, "meteo") == 0) {
+      requestLoraTelemetrySend("meteo", "web");
+    } else if (strcmp(value, "gps") == 0) {
+      requestLoraTelemetrySend("gps", "web");
+    }
+  }
+
+  if (httpQueryValue(path, "lora_payload", value, sizeof(value))) {
+    requestLoraTestSend(value, "web");
+  }
+
+  if (httpQueryValue(path, "lora_clear", value, sizeof(value))) {
+    if (strcmp(value, "1") == 0) {
+      clearLoraHistory();
+      LoraState state = copyLoraState();
+      snprintf(state.note, sizeof(state.note), "Console LoRa limpo via web");
+      storeLoraState(state);
+      Serial.println("[LORA] Console web limpo");
     }
   }
 
@@ -1168,6 +2323,13 @@ static void handleHttpActionPath(const char *path)
     }
   }
 
+  if (httpQueryValue(path, "sd", value, sizeof(value))) {
+    if (strcmp(value, "remount") == 0) {
+      g_blackbox_remount_requested = true;
+      Serial.println("[BLACKBOX] Remount solicitado via web");
+    }
+  }
+
   if (httpQueryValue(path, "level", value, sizeof(value))) {
     if (strcmp(value, "1") == 0) {
       requestEfisLevelSet("web");
@@ -1179,58 +2341,208 @@ static void sendHttpJsonStatus(NetworkClient &client)
 {
   const ImuState imu = copyImuState();
   const BlackboxState blackbox = copyBlackboxState();
+  const Bme688State bme = copyBme688State();
+  const GpsState gps = copyGpsState();
+  const LoraState lora = copyLoraState();
   char ip_text[20];
+  char ap_ip_text[20];
+  char sta_ip_text[20];
   char blackbox_file[80];
+  char blackbox_name[40];
+  char blackbox_note[80];
+  char blackbox_tail[1200];
   char wifi_note[96];
+  char wifi_sta_note[96];
+  char wifi_sta_ssid[96];
+  char bme_note[96];
+  char meteo_summary[160];
+  char meteo_theme[64];
   char sensor_summary[220];
-  formatIpAddress(g_wifi_ap_ip, ip_text, sizeof(ip_text));
+  char sensor_known[220];
+  char sensor_scan_raw[220];
+  char sensor_bosch[240];
+  char sensor_routes[220];
+  char gps_note[96];
+  char gps_sentence[112];
+  char gps_map_osm[220];
+  char gps_map_google[220];
+  char gps_map_hint[160];
+  char lora_note[96];
+  char lora_message[112];
+  char lora_history[1800];
+  formatWifiVisibleIp(ip_text, sizeof(ip_text));
+  formatWifiApIp(ap_ip_text, sizeof(ap_ip_text));
+  formatWifiStaIp(sta_ip_text, sizeof(sta_ip_text));
   sanitizeJsonText(blackbox.file_path[0] ? blackbox.file_path : "-", blackbox_file, sizeof(blackbox_file));
+  sanitizeJsonText(baseFileName(blackbox.file_path), blackbox_name, sizeof(blackbox_name));
+  sanitizeJsonText(blackbox.note, blackbox_note, sizeof(blackbox_note));
+  formatBlackboxTailJson(blackbox_tail, sizeof(blackbox_tail));
   sanitizeJsonText(g_wifi_diag_note, wifi_note, sizeof(wifi_note));
+  sanitizeJsonText(g_wifi_sta_note, wifi_sta_note, sizeof(wifi_sta_note));
+  sanitizeJsonText(g_wifi_sta_ssid, wifi_sta_ssid, sizeof(wifi_sta_ssid));
+  sanitizeJsonText(bme.note, bme_note, sizeof(bme_note));
+  sanitizeJsonText(gps.note, gps_note, sizeof(gps_note));
+  sanitizeJsonText(gps.last_sentence, gps_sentence, sizeof(gps_sentence));
+  sanitizeJsonText(lora.note, lora_note, sizeof(lora_note));
+  sanitizeJsonText(lora.last_message, lora_message, sizeof(lora_message));
+  formatLoraHistoryJson(lora_history, sizeof(lora_history));
+  classifyMeteoTheme(bme, meteo_theme, sizeof(meteo_theme), meteo_summary, sizeof(meteo_summary));
   sanitizeJsonText(g_sensor_compact_cache.c_str(), sensor_summary, sizeof(sensor_summary));
+  sanitizeJsonText(g_sensor_summary_cache.c_str(), sensor_known, sizeof(sensor_known));
+  sanitizeJsonText(g_sensor_scan_compact_cache.c_str(), sensor_scan_raw, sizeof(sensor_scan_raw));
+  sanitizeJsonText(g_sensor_bosch_cache.c_str(), sensor_bosch, sizeof(sensor_bosch));
+  sanitizeJsonText(g_sensor_route_cache.c_str(), sensor_routes, sizeof(sensor_routes));
+
+  if (gps.has_location) {
+    snprintf(
+        gps_map_osm,
+        sizeof(gps_map_osm),
+        "https://www.openstreetmap.org/?mlat=%.6f&mlon=%.6f#map=16/%.6f/%.6f",
+        gps.latitude_deg,
+        gps.longitude_deg,
+        gps.latitude_deg,
+        gps.longitude_deg);
+    snprintf(
+        gps_map_google,
+        sizeof(gps_map_google),
+        "https://www.google.com/maps?q=%.6f,%.6f",
+        gps.latitude_deg,
+        gps.longitude_deg);
+    snprintf(gps_map_hint, sizeof(gps_map_hint), "Mapa pronto. Abra no celular quando houver internet na rede.");
+  } else if (gps.receiving) {
+    snprintf(gps_map_osm, sizeof(gps_map_osm), "");
+    snprintf(gps_map_google, sizeof(gps_map_google), "");
+    snprintf(gps_map_hint, sizeof(gps_map_hint), "GPS recebendo NMEA, mas ainda sem fix. Teste com visao aberta do ceu.");
+  } else {
+    snprintf(gps_map_osm, sizeof(gps_map_osm), "");
+    snprintf(gps_map_google, sizeof(gps_map_google), "");
+    snprintf(gps_map_hint, sizeof(gps_map_hint), "Sem posicao valida ainda. Confira alimentacao, TX/RX e visao do ceu.");
+  }
 
   client.print(F("HTTP/1.1 200 OK\r\n"));
   client.print(F("Content-Type: application/json; charset=utf-8\r\n"));
   client.print(F("Cache-Control: no-store\r\n"));
   client.print(F("Connection: close\r\n\r\n"));
   client.printf(
-      "{\"device\":\"StratosBrain S3\",\"screen\":\"%s\",\"screen_label\":\"%s\","
-      "\"runtime_light\":%s,"
-      "\"wifi\":{\"ap\":%s,\"requested\":%s,\"ssid\":\"%s\",\"password\":\"%s\",\"ip\":\"%s\",\"clients\":%u,\"web_hits\":%lu,\"note\":\"%s\"},"
-      "\"uptime_s\":%lu,"
-      "\"touch\":{\"pressed\":%s,\"x\":%u,\"y\":%u,\"count\":%lu},"
-      "\"imu\":{\"connected\":%s,\"healthy\":%s,\"pitch_deg\":%.1f,\"roll_deg\":%.1f,\"temperature_c\":%.1f},"
-      "\"plane\":{\"altitude_ft\":null,\"vario_fpm\":null,\"heading_deg\":null,\"speed_kmh\":null},"
-      "\"meteo\":{\"theme\":\"demo\",\"summary\":\"Sensores meteorologicos ainda em integracao\"},"
-      "\"comms\":{\"lora_enabled\":%s,\"gps_fix\":false},"
-      "\"blackbox\":{\"mounted\":%s,\"logging_enabled\":%s,\"records\":%lu,\"file\":\"%s\"},"
-      "\"sensors\":{\"summary\":\"%s\"}}\n",
+      "{\"device\":\"StratosBrain S3\",\"screen\":\"%s\",\"screen_label\":\"%s\",\"runtime_light\":%s,",
       screenIdSlug(g_current_screen_id),
       screenIdLabel(g_current_screen_id),
-      g_runtime_services_light ? "true" : "false",
+      g_runtime_services_light ? "true" : "false");
+  client.printf(
+      "\"wifi\":{\"mode\":\"%s\",\"ap\":%s,\"requested\":%s,\"ap_requested\":%s,\"ssid\":\"%s\",\"password\":\"%s\",\"ap_ip\":\"%s\",\"sta_requested\":%s,\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\",\"ip\":\"%s\",\"clients\":%u,\"web_hits\":%lu,\"note\":\"%s\",\"sta_note\":\"%s\"},",
+      wifiModeLabel(),
       g_wifi_ap_started ? "true" : "false",
       g_wifi_mode_requested ? "true" : "false",
+      g_wifi_ap_requested ? "true" : "false",
       WIFI_AP_SSID,
       WIFI_AP_PASSWORD,
+      ap_ip_text,
+      g_wifi_sta_requested ? "true" : "false",
+      g_wifi_sta_connected ? "true" : "false",
+      wifi_sta_ssid,
+      sta_ip_text,
       ip_text,
       static_cast<unsigned>(wifiClientCount()),
       static_cast<unsigned long>(g_wifi_web_hits),
       wifi_note,
-      static_cast<unsigned long>(millis() / 1000UL),
+      wifi_sta_note);
+  client.printf("\"uptime_s\":%lu,", static_cast<unsigned long>(millis() / 1000UL));
+  client.printf(
+      "\"touch\":{\"pressed\":%s,\"x\":%u,\"y\":%u,\"count\":%lu},",
       g_touch_pressed ? "true" : "false",
       static_cast<unsigned>(g_touch_x),
       static_cast<unsigned>(g_touch_y),
-      static_cast<unsigned long>(g_touch_press_count),
+      static_cast<unsigned long>(g_touch_press_count));
+  client.printf(
+      "\"imu\":{\"connected\":%s,\"healthy\":%s,\"pitch_deg\":%.1f,\"roll_deg\":%.1f,\"temperature_c\":%.1f},",
       imu.connected ? "true" : "false",
       imu.healthy ? "true" : "false",
       imu.pitch_deg,
       imu.roll_deg,
-      imu.temperature_c,
+      imu.temperature_c);
+  client.print(F("\"plane\":{\"altitude_ft\":null,\"vario_fpm\":null,\"heading_deg\":null,\"speed_kmh\":null},"));
+  client.printf(
+      "\"meteo\":{\"theme\":\"%s\",\"summary\":\"%s\",\"connected\":%s,\"has_data\":%s,\"temperature_c\":%.1f,\"humidity_pct\":%.1f,\"pressure_hpa\":%.1f,\"altitude_m\":%.1f,\"gas_ohms\":%.0f,\"last_update_ms\":%lu,\"note\":\"%s\"},",
+      meteo_theme,
+      meteo_summary,
+      bme.connected ? "true" : "false",
+      bme.has_data ? "true" : "false",
+      bme.temperature_c,
+      bme.humidity_pct,
+      bme.pressure_hpa,
+      bme.altitude_m,
+      bme.gas_ohms,
+      static_cast<unsigned long>(bme.last_update_ms),
+      bme_note);
+  client.printf(
+      "\"gps\":{\"uart_ready\":%s,\"receiving\":%s,\"fix\":%s,\"has_location\":%s,\"sats\":%u,\"rx_bytes\":%lu,\"line_count\":%lu,\"last_rx_ms\":%lu,\"last_fix_ms\":%lu,\"lat\":%.6f,\"lon\":%.6f,\"alt_m\":%.1f,\"speed_kmh\":%.1f,\"last_sentence\":\"%s\",\"note\":\"%s\",\"map_osm\":\"%s\",\"map_google\":\"%s\",\"map_hint\":\"%s\"},",
+      gps.uart_ready ? "true" : "false",
+      gps.receiving ? "true" : "false",
+      gps.has_fix ? "true" : "false",
+      gps.has_location ? "true" : "false",
+      static_cast<unsigned>(gps.sats),
+      static_cast<unsigned long>(gps.rx_bytes),
+      static_cast<unsigned long>(gps.line_count),
+      static_cast<unsigned long>(gps.last_rx_ms),
+      static_cast<unsigned long>(gps.last_fix_ms),
+      gps.latitude_deg,
+      gps.longitude_deg,
+      gps.altitude_m,
+      gps.speed_kmh,
+      gps_sentence,
+      gps_note,
+      gps_map_osm,
+      gps_map_google,
+      gps_map_hint);
+  client.printf(
+      "\"lora\":{\"enabled\":%s,\"uart_ready\":%s,\"aux_high\":%s,\"receiving\":%s,\"rx_bytes\":%lu,\"tx_bytes\":%lu,\"last_rx_ms\":%lu,\"last_tx_ms\":%lu,\"last_message\":\"%s\",\"note\":\"%s\",\"history\":\"%s\",\"console_note\":\"Console de payload UART LoRa. Nao e analisador SDR/RF.\"},",
+      lora.enabled ? "true" : "false",
+      lora.uart_ready ? "true" : "false",
+      lora.aux_high ? "true" : "false",
+      lora.receiving ? "true" : "false",
+      static_cast<unsigned long>(lora.rx_bytes),
+      static_cast<unsigned long>(lora.tx_bytes),
+      static_cast<unsigned long>(lora.last_rx_ms),
+      static_cast<unsigned long>(lora.last_tx_ms),
+      lora_message,
+      lora_note,
+      lora_history);
+  client.printf(
+      "\"comms\":{\"lora_enabled\":%s,\"lora_uart_ready\":%s,\"gps_fix\":%s,\"gps_uart_ready\":%s,\"gps_receiving\":%s},",
       g_lora_enabled ? "true" : "false",
+      g_lora_uart_ready ? "true" : "false",
+      gps.has_fix ? "true" : "false",
+      g_gps_uart_ready ? "true" : "false",
+      gps.receiving ? "true" : "false");
+  client.printf(
+      "\"lab\":{\"bme_ok\":%s,\"gps_ok\":%s,\"lora_ok\":%s},",
+      bme.has_data ? "true" : "false",
+      gps.receiving ? "true" : "false",
+      lora.uart_ready ? "true" : "false");
+  client.printf(
+      "\"blackbox\":{\"mounted\":%s,\"logging_enabled\":%s,\"file_open\":%s,\"last_write_ok\":%s,\"records\":%lu,\"last_log_ms\":%lu,\"card_size_bytes\":%llu,\"file\":\"%s\",\"file_name\":\"%s\",\"note\":\"%s\",\"tail\":\"%s\"},",
       blackbox.mounted ? "true" : "false",
       blackbox.logging_enabled ? "true" : "false",
+      blackbox.file_open ? "true" : "false",
+      blackbox.last_write_ok ? "true" : "false",
       static_cast<unsigned long>(blackbox.records_written),
+      static_cast<unsigned long>(blackbox.last_log_ms),
+      static_cast<unsigned long long>(blackbox.card_size_bytes),
       blackbox_file,
-      sensor_summary);
+      blackbox_name,
+      blackbox_note,
+      blackbox_tail);
+  client.printf(
+      "\"ui\":{\"rotation\":\"%s\",\"orientation\":\"%s\"},",
+      rotationLabel(g_display_rotation),
+      orientationModeLabel(g_orientation_mode));
+  client.printf(
+      "\"sensors\":{\"summary\":\"%s\",\"known\":\"%s\",\"scan\":\"%s\",\"bosch\":\"%s\",\"routes\":\"%s\"}}\n",
+      sensor_summary,
+      sensor_known,
+      sensor_scan_raw,
+      sensor_bosch,
+      sensor_routes);
 }
 
 static void sendHttpDashboard(NetworkClient &client)
@@ -1239,57 +2551,131 @@ static void sendHttpDashboard(NetworkClient &client)
   client.print(F("Content-Type: text/html; charset=utf-8\r\n"));
   client.print(F("Cache-Control: no-store\r\n"));
   client.print(F("Connection: close\r\n\r\n"));
+  client.print(F(R"SBWEB(<!DOCTYPE html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>StratosBrain S3</title>
+<style>
+:root{--bg:#071019;--panel:#0d1823;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59}
+*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text)}
+.wrap{padding:16px;max-width:1180px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}
+.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:6px 0 8px;font-size:34px}.lead{color:var(--muted);font-size:15px;line-height:1.5}
+.hero-grid,.grid,.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.hero-grid{margin-top:12px}
+.mini,.card{background:rgba(7,14,21,.45);border:1px solid rgba(111,214,255,.18);border-radius:16px;padding:14px;transition:background-color .24s ease,border-color .24s ease,color .18s ease,opacity .18s ease}.card{background:var(--panel);border-color:#21364a}
+.mini b,.card h3{display:block;margin:0 0 8px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}
+.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}
+.btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.small{padding:8px 12px;font-size:13px}
+.tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}
+.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.muted{color:var(--muted);font-size:14px;line-height:1.55}.mono{font-family:Consolas,monospace}
+.footer{margin-top:14px;color:var(--muted);font-size:12px;transition:color .18s ease,opacity .18s ease}
+input{width:100%;background:#08131d;border:1px solid #21445f;border-radius:10px;color:#eef6ff;padding:10px 12px;margin-top:8px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:Consolas,monospace;background:#08131d;border:1px solid #1d3245;border-radius:12px;padding:12px;min-height:150px;color:#d7edf7}
+</style></head><body><div class='wrap'>
+<div class='hero'><div class='eyebrow'>StratosBrain S3</div><h1>Lab Web</h1><div class='lead'>Painel de bancada para validar BME688, GPS, SD card e conectividade local sem trocar de firmware.</div>
+<div class='hero-grid'>
+<div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div>
+<div class='mini'><b>LAN local</b><span id='heroLan'>--</span></div>
+<div class='mini'><b>URL principal</b><span class='mono' id='heroUrl'>--</span></div>
+<div class='mini'><b>Modo / tela</b><span id='heroMode'>--</span></div>
+</div>
+<div class='actions'>
+<button class='btn alt' onclick="act('wifi=toggle')">AP on/off</button>
+<button class='btn small' onclick="act('logger=toggle')">Logger on/off</button>
+<button class='btn small' onclick="act('rescan=1')">Rescan</button>
+<button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button>
+</div></div>
+<div class='tabs'>
+<button class='btn tab active' data-tab='lab' onclick="setTab('lab')">Lab</button>
+<button class='btn tab' data-tab='gps' onclick="setTab('gps')">GPS</button>
+<button class='btn tab' data-tab='sd' onclick="setTab('sd')">SD</button>
+<button class='btn tab' data-tab='meteo' onclick="setTab('meteo')">Meteo</button>
+<button class='btn tab' data-tab='comms' onclick="setTab('comms')">Rede</button>
+<button class='btn tab' data-tab='lora' onclick="setTab('lora')">LoRa</button>
+<button class='btn tab' data-tab='config' onclick="setTab('config')">Config</button>
+<button class='btn tab' data-tab='overview' onclick="setTab('overview')">Overview</button>
+</div>)SBWEB"));
+  client.print(F(R"SBWEB(
+<section class='section active' id='section-lab'><div class='split'>
+<div class='card'><h3>BME688</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Endereco: <span class='mono' id='labBmeAddr'>--</span><br>Temp: <span id='labBmeTemp'>--</span><br>Umidade: <span id='labBmeHum'>--</span><br>Pressao: <span id='labBmePress'>--</span><br>Altitude: <span id='labBmeAlt'>--</span><br>Gas: <span id='labBmeGas'>--</span><br>Nariz digital: <span id='labBmeGasMode'>--</span><br>Nota: <span id='labBmeNote'>--</span></div></div>
+<div class='card'><h3>GPS</h3><div class='big' id='labGpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44</span><br>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Alt/Vel: <span id='labGpsMotion'>--</span><br>Ultima NMEA: <span class='mono' id='labGpsSentence'>--</span></div></div>
+<div class='card'><h3>LoRa UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>Pinos: <span class='mono'>TX17 RX18 AUX6 M0/1 7/8</span><br>AUX: <span id='labLoraAux'>--</span><br>RX/TX bytes: <span id='labLoraTraffic'>--</span><br>Ultima msg: <span class='mono' id='labLoraMsg'>--</span><br>Nota: <span id='labLoraNote'>--</span></div><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button><button class='btn small' onclick="setTab('lora')">Abrir console LoRa</button></div></div>
+</div></section>
+<section class='section' id='section-gps'><div class='split'>
+<div class='card'><h3>Status GPS</h3><div class='big' id='gpsState'>--</div><div class='muted'>UART: <span class='mono'>RX43 / TX44 @ 9600</span><br>Fix: <span id='gpsFix'>--</span><br>Satelites: <span id='gpsSats'>--</span><br>Recebendo: <span id='gpsReceiving'>--</span><br>Bytes RX: <span id='gpsBytes'>--</span><br>Linhas NMEA: <span id='gpsLines'>--</span><br>Ultimo RX: <span id='gpsLastRx'>--</span><br>Ultimo fix: <span id='gpsLastFix'>--</span></div></div>
+<div class='card'><h3>Posicao</h3><div class='big' id='gpsLatLon'>--</div><div class='muted'>Altitude: <span id='gpsAlt'>--</span><br>Velocidade: <span id='gpsSpeed'>--</span><br>Nota: <span id='gpsNote'>--</span></div></div>
+<div class='card'><h3>Mapa</h3><div class='muted'>Abra o mapa no celular quando houver coordenadas validas.<br>Dica: o AP puro pode deixar o celular sem internet; em `LAN` o mapa tende a funcionar melhor.</div><div class='actions'><a class='btn small' id='gpsOsmLink' href='#' target='_blank' rel='noopener noreferrer'>OpenStreetMap</a><a class='btn small' id='gpsGoogleLink' href='#' target='_blank' rel='noopener noreferrer'>Google Maps</a></div><div class='footer' id='gpsMapHint'>--</div></div>
+<div class='card'><h3>Ultima NMEA</h3><pre id='gpsSentence'>--</pre></div>
+</div></section>
+<section class='section' id='section-sd'><div class='split'>
+<div class='card'><h3>Status SD</h3><div class='big' id='sdState'>--</div><div class='muted'>Capacidade: <span id='sdSize'>--</span><br>Logger: <span id='sdLogger'>--</span><br>Arquivo: <span class='mono' id='sdFile'>--</span><br>Nome: <span class='mono' id='sdName'>--</span><br>Registros: <span id='sdRecords'>--</span><br>Ultima escrita: <span id='sdLast'>--</span><br>Nota: <span id='sdNote'>--</span></div><div class='actions'><button class='btn small' onclick="act('logger=toggle')">Logger on/off</button><button class='btn small' onclick="act('sd=remount')">Remount SD</button></div></div>
+<div class='card'><h3>Ultimos registros</h3><pre id='sdTail'>--</pre></div>
+</div></section>
+<section class='section' id='section-meteo'><div class='split'>
+<div class='card'><h3>Clima</h3><div class='big' id='mtTheme'>--</div><div class='muted' id='mtSummary'>--</div><div class='footer'>Gas bruto: <span id='mtGas'>--</span><br>BME688 IA/odores: etapa futura com BSEC2 + treino.</div></div>
+<div class='card'><h3>Altitude</h3><div class='big' id='mtAlt'>--</div><div class='muted'>estimada pela pressao do BME688</div></div>
+<div class='card'><h3>Pressao</h3><div class='big' id='mtPress'>--</div><div class='muted'>leitura barometrica</div></div>
+<div class='card'><h3>Temperatura</h3><div class='big' id='mtTemp'>--</div><div class='muted'>ambiente local</div></div>
+<div class='card'><h3>Umidade</h3><div class='big' id='mtHum'>--</div><div class='muted'>umidade relativa</div></div>
+</div></section>
+<section class='section' id='section-comms'><div class='split'>
+<div class='card'><h3>Rede</h3><div class='muted'>Modo: <span id='cmMode'>--</span><br>AP: <span class='mono' id='cmApUrl'>--</span><br>LAN: <span class='mono' id='cmStaUrl'>--</span><br>Clientes AP: <span id='cmClients'>--</span><br>Hits web: <span id='cmHits'>--</span><br>Nota: <span id='cmNote'>--</span><br>Nota LAN: <span id='cmStaNote'>--</span></div></div>
+<div class='card'><h3>Entrar na rede local</h3><div class='muted'>SSID</div><input id='cmStaSsid' type='text' placeholder='Wi-Fi da casa'><div class='muted'>Senha</div><input id='cmStaPass' type='password' placeholder='Senha da rede'><div class='actions'><button class='btn alt' onclick='connectSta()'>Conectar LAN</button><button class='btn small' onclick="act('sta=off')">Desligar LAN</button><button class='btn small' onclick="act('sta=forget')">Limpar</button></div></div>
+<div class='card'><h3>Mapa de integracao</h3><div class='muted'>Sensores: <span id='cmSensors'>--</span><br>Rotas: <span id='cmRoutes'>--</span><br>Scan I2C: <span class='mono' id='cmScan'>--</span></div></div>
+</div></section>)SBWEB"));
+  client.print(F(R"SBWEB(
+<section class='section' id='section-lora'><div class='split'><div class='card'><h3>Estado LoRa</h3><div class='big' id='lrState'>--</div><div class='muted'>UART: <span class='mono'>TX17 RX18 | AUX6 | M0/1 7/8</span><br>AUX: <span id='lrAux'>--</span><br>RX bytes: <span id='lrRx'>--</span><br>TX bytes: <span id='lrTx'>--</span><br>Ultimo RX: <span id='lrLastRx'>--</span><br>Ultimo TX: <span id='lrLastTx'>--</span><br>Ultima msg: <span class='mono' id='lrMsg'>--</span><br>Nota: <span id='lrPlan'>--</span></div><div class='footer' id='lrConsoleHint'>--</div></div><div class='card'><h3>Console LoRa</h3><div class='muted'>Mostra o trafego de payload/UART do modulo LoRa. Nao mostra espectro RF bruto como SDR. Destino atual: outro modulo LoRa remoto com a mesma configuracao, nao um servidor web automatico.</div><input id='lrPayload' type='text' placeholder='Ex: TEMP=27.5,PRESS=1008.2'><div class='actions'><button class='btn warn' onclick="act('lora=toggle')">LoRa on/off</button><button class='btn small' onclick="sendLoraPayload()">Enviar payload</button><button class='btn small' onclick="act('lora_tx=ping')">PING</button><button class='btn small' onclick="act('lora_tx=status')">STATUS?</button><button class='btn small' onclick="act('lora_tx=meteo')">Enviar METEO</button><button class='btn small' onclick="act('lora_tx=gps')">Enviar GPS</button><button class='btn small' onclick="act('lora_clear=1')">Limpar console</button></div><pre id='lrConsole'>--</pre></div></div></section>
+<section class='section' id='section-config'><div class='split'><div class='card'><h3>Config</h3><div class='muted'>Tela ativa: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Orientacao: <span id='cfOrientation'>--</span><br>Rotacao: <span id='cfRotation'>--</span><br>Logger: <span id='cfLogger'>--</span><br>Ultima escrita: <span id='cfLastLog'>--</span></div></div><div class='card'><h3>SD e sensores</h3><div class='muted'>Arquivo: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Nota SD: <span id='cfNote'>--</span><br>Sensores: <span id='cfSensors'>--</span><br>Scan I2C: <span class='mono' id='cfScan'>--</span></div></div></div></section>
+<section class='section' id='section-overview'><div class='grid'><div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes AP: <span id='ovClients'>--</span></div></div><div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div><div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div><div class='card'><h3>Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div></div></section>
+<script>
+const $=i=>document.getElementById(i), txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v, toText=v=>String(txt(v));
+const put=(i,v)=>{const e=$(i); if(!e)return; const next=toText(v); if(e.textContent!==next)e.textContent=next;};
+const val=(i,v)=>{const e=$(i); const next=v||''; if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
+const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
+function linkify(id,href,label){const e=$(id); if(!e)return; const enabled=!!(href&&href!==''&&href!=='--'); const nextHref=enabled?href:'#'; const nextLabel=enabled?(label||href):(label||'Indisponivel'); const nextOpacity=enabled?'1':'.5'; const nextPointer=enabled?'auto':'none'; if(e.href!==nextHref)e.href=nextHref; if(e.textContent!==nextLabel)e.textContent=nextLabel; if(e.style.pointerEvents!==nextPointer)e.style.pointerEvents=nextPointer; if(e.style.opacity!==nextOpacity)e.style.opacity=nextOpacity;}
+function setTab(n){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}
+let refreshBusy=false,lastRefreshAt=0,refreshTimer=null;
+function scheduleRefresh(delayMs=0){if(refreshTimer)clearTimeout(refreshTimer); refreshTimer=setTimeout(()=>refresh(true),delayMs);}
+function act(q,delayMs=320){fetch('/api/action?'+q,{cache:'no-store'}).then(()=>scheduleRefresh(delayMs)).catch(()=>scheduleRefresh(900));}
+function fmtMs(v){return(v===undefined||v===null||v===0)?'--':String(v)+' ms';} function fmtUrl(ip){return(!ip||ip==='--')?'--':'http://'+ip;} function fmtBytes(v){if(!v)return'--'; const gb=v/1073741824; if(gb>=1)return gb.toFixed(1)+' GB'; return (v/1048576).toFixed(1)+' MB';}
+function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){alert('Digite o SSID da rede local.'); return;} act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on',1200);}
+function sendLoraPayload(){const payload=$('lrPayload').value.trim(); if(!payload){alert('Digite um payload para enviar no LoRa.'); return;} act('lora_payload='+encodeURIComponent(payload),500);}
+['cmStaSsid','cmStaPass'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>e.dataset.user='1');});
+function refresh(force=false){const now=Date.now(); if(refreshBusy)return; if(!force&&now-lastRefreshAt<1800)return; refreshBusy=true; fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{put('heroAp',yes(d.wifi.ap,'AP ativo','AP offline')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?('Conectando em '+txt(d.wifi.sta_ssid,'--')):'LAN desligada')); put('heroUrl',fmtUrl(d.wifi.ip)); put('heroMode',txt(d.wifi.mode)+' | '+txt(d.screen_label));
+put('labBmeState',d.meteo.connected?(d.meteo.has_data?'BME lendo':'BME detectado'):'BME OFF'); put('labBmeAddr',d.sensors.scan.includes('0x77')?'0x77':(d.sensors.scan.includes('0x76')?'0x76':'--')); put('labBmeTemp',num(d.meteo.temperature_c,' C')); put('labBmeHum',num(d.meteo.humidity_pct,' %')); put('labBmePress',num(d.meteo.pressure_hpa,' hPa')); put('labBmeAlt',num(d.meteo.altitude_m,' m')); put('labBmeGas',num(d.meteo.gas_ohms,' ohms')); put('labBmeGasMode',d.meteo.has_data?'Gas bruto OK | IA futura':'Aguardando leitura'); put('labBmeNote',txt(d.meteo.note));
+put('labGpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'NMEA RX':'GPS aguardando')); put('labGpsFix',d.gps.fix?('OK / '+txt(d.gps.sats)+' sats'):'sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsMotion',num(d.gps.alt_m,' m')+' / '+num(d.gps.speed_kmh,' km/h')); put('labGpsSentence',txt(d.gps.last_sentence));
+put('labLoraState',d.lora.enabled?(d.lora.receiving?'RX ativo':'LoRa ON'):'LoRa OFF'); put('labLoraAux',yes(d.lora.aux_high,'HIGH','LOW')); put('labLoraTraffic',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes)); put('labLoraMsg',txt(d.lora.last_message)); put('labLoraNote',txt(d.lora.note));
+put('gpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'recebendo NMEA':'aguardando')); put('gpsFix',yes(d.gps.fix,'fix valido','sem fix')); put('gpsSats',txt(d.gps.sats)); put('gpsReceiving',yes(d.gps.receiving,'sim','nao')); put('gpsBytes',txt(d.gps.rx_bytes)); put('gpsLines',txt(d.gps.line_count)); put('gpsLastRx',fmtMs(d.gps.last_rx_ms)); put('gpsLastFix',fmtMs(d.gps.last_fix_ms)); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsNote',txt(d.gps.note)); put('gpsSentence',txt(d.gps.last_sentence)); put('gpsMapHint',txt(d.gps.map_hint)); linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps');
+put('sdState',yes(d.blackbox.mounted,'montado','sem cartao')); put('sdSize',fmtBytes(d.blackbox.card_size_bytes)); put('sdLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('sdFile',txt(d.blackbox.file)); put('sdName',txt(d.blackbox.file_name)); put('sdRecords',txt(d.blackbox.records)); put('sdLast',fmtMs(d.blackbox.last_log_ms)); put('sdNote',txt(d.blackbox.note)); put('sdTail',txt(d.blackbox.tail).replaceAll('\\n','\n'));
+put('mtTheme',txt(d.meteo.theme)); put('mtSummary',txt(d.meteo.summary)); put('mtTemp',num(d.meteo.temperature_c,' C')); put('mtHum',num(d.meteo.humidity_pct,' %')); put('mtPress',num(d.meteo.pressure_hpa,' hPa')); put('mtAlt',num(d.meteo.altitude_m,' m')); put('mtGas',num(d.meteo.gas_ohms,' ohms'));
+put('cmMode',txt(d.wifi.mode)); put('cmApUrl',fmtUrl(d.wifi.ap_ip)); put('cmStaUrl',d.wifi.sta_connected?fmtUrl(d.wifi.sta_ip):'--'); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); put('cmNote',txt(d.wifi.note)); put('cmStaNote',txt(d.wifi.sta_note)); put('cmSensors',txt(d.sensors.summary)); put('cmRoutes',txt(d.sensors.routes)); put('cmScan',txt(d.sensors.scan)); val('cmStaSsid',txt(d.wifi.sta_ssid,''));
+put('lrState',yes(d.lora.enabled,'ligado','desligado')); put('lrAux',yes(d.lora.aux_high,'HIGH','LOW')); put('lrRx',txt(d.lora.rx_bytes)); put('lrTx',txt(d.lora.tx_bytes)); put('lrLastRx',fmtMs(d.lora.last_rx_ms)); put('lrLastTx',fmtMs(d.lora.last_tx_ms)); put('lrMsg',txt(d.lora.last_message)); put('lrPlan',txt(d.lora.note)); put('lrConsole',txt(d.lora.history).replaceAll('\\n','\n')); put('lrConsoleHint',txt(d.lora.console_note));
+put('cfScreen',txt(d.screen_label)); put('cfMode',d.runtime_light?'leve':'normal'); put('cfOrientation',txt(d.ui.orientation)); put('cfRotation',txt(d.ui.rotation)); put('cfLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('cfLastLog',fmtMs(d.blackbox.last_log_ms)); put('cfFile',txt(d.blackbox.file)); put('cfRecords',txt(d.blackbox.records)); put('cfNote',txt(d.blackbox.note)); put('cfSensors',txt(d.sensors.known)); put('cfScan',txt(d.sensors.scan));
+put('ovUptime',num(d.uptime_s,' s')); put('ovHits',txt(d.wifi.web_hits)); put('ovClients',txt(d.wifi.clients)); put('ovImu',d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF'); put('ovPitch',num(d.imu.pitch_deg,' deg')); put('ovRoll',num(d.imu.roll_deg,' deg')); put('ovTemp',num(d.imu.temperature_c,' C')); put('ovTouch',yes(d.touch.pressed,'ON','OFF')); put('ovTouchXY',txt(d.touch.x)+','+txt(d.touch.y)); put('ovTouchCount',txt(d.touch.count)); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records)); lastRefreshAt=Date.now();}).catch(()=>{}).finally(()=>{refreshBusy=false;});}
+setTab('lab'); refresh(true); setInterval(()=>refresh(false),2600);
+</script></div></body></html>)SBWEB"));
+  return;
+  client.print(F("HTTP/1.1 200 OK\r\n"));
+  client.print(F("Content-Type: text/html; charset=utf-8\r\n"));
+  client.print(F("Cache-Control: no-store\r\n"));
+  client.print(F("Connection: close\r\n\r\n"));
   client.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"));
   client.print(F("<meta name='viewport' content='width=device-width,initial-scale=1'>"));
   client.print(F("<title>StratosBrain S3</title>"));
-  client.print(F("<style>:root{--bg:#071019;--panel:#0d1823;--panel2:#101f2d;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59;}*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text)}a{color:#8bddff}.wrap{padding:16px;max-width:1120px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:6px 0 10px;font-size:34px}.hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:10px}.mini{background:rgba(7,14,21,.45);border:1px solid rgba(111,214,255,.18);border-radius:14px;padding:10px 12px}.mini b{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}.btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.small{padding:8px 12px;font-size:13px}.tabs{margin:14px 0}.tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:var(--panel);border:1px solid #21364a;border-radius:18px;padding:14px}.card h3{margin:0 0 10px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}.big{font-size:31px;font-weight:700;margin:6px 0}.muted{color:var(--muted);font-size:14px;line-height:1.45}.section{display:none}.section.active{display:block}.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#123046;border:1px solid #275779;color:#dff6ff;font-size:12px;font-weight:700}.ok{color:var(--ok)}.warnc{color:var(--warn)}.mono{font-family:Consolas,monospace}.footer{margin-top:14px;color:var(--muted);font-size:12px}</style></head><body>"));
-  client.print(F("<div class='wrap'><div class='hero'><div class='eyebrow'>StratosBrain S3</div><h1>Console Web</h1>"));
-  client.print(F("<div class='hero-grid'>"));
-  client.print(F("<div class='mini'><b>Wi-Fi AP</b><span id='heroWifi'>--</span></div>"));
-  client.print(F("<div class='mini'><b>SSID / Senha</b><span class='mono' id='heroCreds'>--</span></div>"));
-  client.print(F("<div class='mini'><b>IP / Tela ativa</b><span class='mono' id='heroIp'>--</span></div>"));
-  client.print(F("<div class='mini'><b>Modo</b><span id='heroMode'>--</span></div>"));
-  client.print(F("</div>"));
-  client.print(F("<div class='actions'>"));
-  client.print(F("<button class='btn' onclick=\"act('screen=home')\">Home</button>"));
-  client.print(F("<button class='btn' onclick=\"act('screen=plane')\">Plane</button>"));
-  client.print(F("<button class='btn' onclick=\"act('screen=meteo')\">Meteo</button>"));
-  client.print(F("<button class='btn' onclick=\"act('screen=comms')\">Comms</button>"));
-  client.print(F("<button class='btn' onclick=\"act('screen=config')\">Config</button>"));
-  client.print(F("<button class='btn alt' onclick=\"act('wifi=toggle')\">Wi-Fi on/off</button>"));
-  client.print(F("<button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button>"));
-  client.print(F("<button class='btn small' onclick=\"act('rescan=1')\">Rescan</button>"));
-  client.print(F("</div></div>"));
-  client.print(F("<div class='tabs'>"));
-  client.print(F("<button class='btn tab active' data-tab='overview' onclick=\"setTab('overview')\">Overview</button>"));
-  client.print(F("<button class='btn tab' data-tab='plane' onclick=\"setTab('plane')\">Plane</button>"));
-  client.print(F("<button class='btn tab' data-tab='meteo' onclick=\"setTab('meteo')\">Meteo</button>"));
-  client.print(F("<button class='btn tab' data-tab='comms' onclick=\"setTab('comms')\">Comms</button>"));
-  client.print(F("<button class='btn tab' data-tab='config' onclick=\"setTab('config')\">Config</button>"));
-  client.print(F("</div>"));
-  client.print(F("<section class='section active' id='section-overview'><div class='grid'>"));
-  client.print(F("<div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes: <span id='ovClients'>--</span></div></div>"));
-  client.print(F("<div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div>"));
-  client.print(F("<div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div>"));
-  client.print(F("<div class='card'><h3>SD / Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div>"));
+  client.print(F("<style>:root{--bg:#071019;--panel:#0d1823;--panel2:#101f2d;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59;}*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text)}a{color:#8bddff}.wrap{padding:16px;max-width:1180px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}.eyebrow{color:var(--accent);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.hero h1{margin:6px 0 8px;font-size:34px}.lead{color:var(--muted);font-size:15px;line-height:1.5}.hero-grid,.grid,.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.hero-grid{margin-top:12px}.mini,.card{background:rgba(7,14,21,.45);border:1px solid rgba(111,214,255,.18);border-radius:16px;padding:14px}.card{background:var(--panel);border-color:#21364a}.mini b,.card h3{display:block;margin:0 0 8px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}.actions,.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}.btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.small{padding:8px 12px;font-size:13px}.tab{background:#0c1722;border:1px solid #20384d;color:#cfe3f4}.tab.active{background:#143048;border-color:#4abfff;color:#fff}.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.big.small{font-size:22px}.muted{color:var(--muted);font-size:14px;line-height:1.5}.mono{font-family:Consolas,monospace}.ok{color:var(--ok)}.warnc{color:var(--warn)}.danger{color:var(--danger)}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#123046;border:1px solid #275779;color:#dff6ff;font-size:12px;font-weight:700}.footer{margin-top:14px;color:var(--muted);font-size:12px}.kv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.span2{grid-column:1/-1}</style></head><body>"));
+  client.print(F("<div class='wrap'><div class='hero'><div class='eyebrow'>StratosBrain S3</div><h1>Lab Web</h1><div class='lead'>Painel de bancada para validar BME688, GPS UART e LoRa UART antes de integrar tudo no cockpit.</div>"));
+  client.print(F("<div class='hero-grid'><div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div><div class='mini'><b>IP / URL</b><span class='mono' id='heroIp'>--</span></div><div class='mini'><b>Tela ativa</b><span id='heroScreen'>--</span></div><div class='mini'><b>Modo</b><span id='heroMode'>--</span></div></div>"));
+  client.print(F("<div class='actions'><button class='btn alt' onclick=\"act('wifi=toggle')\">Wi-Fi on/off</button><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('rescan=1')\">Rescan</button><button class='btn small' onclick=\"act('lora_tx=ping')\">LoRa PING</button></div></div>"));
+  client.print(F("<div class='tabs'><button class='btn tab active' data-tab='lab' onclick=\"setTab('lab')\">Lab</button><button class='btn tab' data-tab='meteo' onclick=\"setTab('meteo')\">Meteo</button><button class='btn tab' data-tab='comms' onclick=\"setTab('comms')\">Comms</button><button class='btn tab' data-tab='lora' onclick=\"setTab('lora')\">LoRa</button><button class='btn tab' data-tab='config' onclick=\"setTab('config')\">Config</button><button class='btn tab' data-tab='overview' onclick=\"setTab('overview')\">Overview</button></div>"));
+  client.print(F("<section class='section active' id='section-lab'><div class='split'>"));
+  client.print(F("<div class='card'><h3>BME688</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Endereco: <span class='mono' id='labBmeAddr'>--</span><br>Temp: <span id='labBmeTemp'>--</span><br>Umidade: <span id='labBmeHum'>--</span><br>Pressao: <span id='labBmePress'>--</span><br>Altitude: <span id='labBmeAlt'>--</span><br>Gas: <span id='labBmeGas'>--</span><br>Nota: <span id='labBmeNote'>--</span></div><div class='actions'><button class='btn small' onclick=\"act('screen=meteo')\">Abrir METEO</button><button class='btn small' onclick=\"act('rescan=1')\">Atualizar I2C</button></div></div>"));
+  client.print(F("<div class='card'><h3>GPS UART</h3><div class='big' id='labGpsState'>--</div><div class='muted'>UART: <span class='mono' id='labGpsUart'>RX43 / TX44</span><br>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Alt/Vel: <span id='labGpsMotion'>--</span><br>Ultima NMEA: <span class='mono' id='labGpsSentence'>--</span><br>Nota: <span id='labGpsNote'>--</span></div><div class='actions'><button class='btn small' onclick=\"act('screen=comms')\">Abrir COMMS</button></div></div>"));
+  client.print(F("<div class='card'><h3>LoRa UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>Pinos: <span class='mono' id='labLoraPins'>TX17 RX18 AUX6 M0/1 7/8</span><br>AUX: <span id='labLoraAux'>--</span><br>RX/TX bytes: <span id='labLoraTraffic'>--</span><br>Ultima msg: <span class='mono' id='labLoraMsg'>--</span><br>Nota: <span id='labLoraNote'>--</span></div><div class='actions'><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('lora_tx=ping')\">Enviar PING</button><button class='btn small' onclick=\"act('screen=lora')\">Abrir LORA</button></div></div>"));
   client.print(F("</div></section>"));
-  client.print(F("<section class='section' id='section-plane'><div class='split'>"));
-  client.print(F("<div class='card'><h3>PLANE</h3><div class='kv'><div><div class='muted'>Pitch</div><div class='big' id='plPitch'>--</div></div><div><div class='muted'>Roll</div><div class='big' id='plRoll'>--</div></div><div><div class='muted'>ALT</div><div class='big' id='plAlt'>--</div></div><div><div class='muted'>V/S</div><div class='big' id='plVario'>--</div></div><div><div class='muted'>HDG</div><div class='big' id='plHdg'>--</div></div><div><div class='muted'>SPD</div><div class='big' id='plSpd'>--</div></div></div></div>"));
-  client.print(F("<div class='card'><h3>Controles</h3><div class='muted'>Use esta area para abrir a tela de voo no dispositivo e calibrar o nivel atual do IMU.</div><div class='actions'><button class='btn' onclick=\"act('screen=plane')\">Abrir PLANE</button><button class='btn alt' onclick=\"act('level=1')\">Setar nivel</button></div><div class='footer'>Ate conectar BMP581, GPS e BMM350, alguns instrumentos seguem como placeholder.</div></div>"));
-  client.print(F("</div></section>"));
-  client.print(F("<section class='section' id='section-meteo'><div class='split'>"));
-  client.print(F("<div class='card'><h3>METEO</h3><div class='big' id='mtTheme'>--</div><div class='muted' id='mtSummary'>--</div></div>"));
-  client.print(F("<div class='card'><h3>Sensores</h3><div class='muted' id='mtSensors'>--</div><div class='actions'><button class='btn small' onclick=\"act('screen=meteo')\">Abrir METEO</button><button class='btn small' onclick=\"act('rescan=1')\">Atualizar sensores</button></div></div>"));
-  client.print(F("</div></section>"));
-  client.print(F("<section class='section' id='section-comms'><div class='split'>"));
-  client.print(F("<div class='card'><h3>Rede</h3><div class='muted'>SSID: <span class='mono' id='cmSsid'>--</span><br>Senha: <span class='mono' id='cmPass'>--</span><br>IP: <span class='mono' id='cmIp'>--</span><br>Clientes: <span id='cmClients'>--</span><br>Nota: <span id='cmNote'>--</span></div></div>"));
-  client.print(F("<div class='card'><h3>Radio e GPS</h3><div class='muted'>LoRa: <span id='cmLora'>--</span><br>GPS: <span id='cmGps'>placeholder</span></div><div class='actions'><button class='btn alt' onclick=\"act('wifi=toggle')\">Wi-Fi on/off</button><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('screen=comms')\">Abrir COMMS</button></div></div>"));
-  client.print(F("</div></section>"));
-  client.print(F("<section class='section' id='section-config'><div class='split'>"));
-  client.print(F("<div class='card'><h3>CONFIG</h3><div class='muted'>Tela ativa: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Logger: <span id='cfLogger'>--</span></div><div class='actions'><button class='btn' onclick=\"act('screen=config')\">Abrir CONFIG</button><button class='btn small' onclick=\"act('logger=toggle')\">Pausar/ligar logger</button></div></div>"));
-  client.print(F("<div class='card'><h3>Arquivo e sensores</h3><div class='muted'>Arquivo atual: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Sensores: <span id='cfSensors'>--</span></div></div>"));
-  client.print(F("</div></section>"));
-  client.print(F("<script>const $=i=>document.getElementById(i);let tab='overview';function setTab(n){tab=n;document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}function act(q){fetch('/api/action?'+q,{cache:'no-store'}).then(()=>setTimeout(refresh,180)).catch(()=>setTimeout(refresh,600));}function txt(v,d='--'){return(v===undefined||v===null||v==='')?d:v;}function yes(v,a='ON',b='OFF'){return v?a:b;}function num(v,s=''){return(v===undefined||v===null)?'--':String(v)+s;}function refresh(){fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{$('heroWifi').textContent=yes(d.wifi.ap,'AP ativo','AP offline');$('heroCreds').textContent=d.wifi.ssid+' / '+d.wifi.password;$('heroIp').textContent=d.wifi.ip+' / '+d.screen_label;$('heroMode').textContent=d.runtime_light?'modo leve':'cockpit completo';$('ovUptime').textContent=num(d.uptime_s,'s');$('ovHits').textContent=txt(d.wifi.web_hits);$('ovClients').textContent=txt(d.wifi.clients);$('ovImu').textContent=d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF';$('ovPitch').textContent=num(d.imu.pitch_deg,' deg');$('ovRoll').textContent=num(d.imu.roll_deg,' deg');$('ovTemp').textContent=num(d.imu.temperature_c,' C');$('ovTouch').textContent=yes(d.touch.pressed,'ON','OFF');$('ovTouchXY').textContent=txt(d.touch.x)+','+txt(d.touch.y);$('ovTouchCount').textContent=txt(d.touch.count);$('ovSd').textContent=yes(d.blackbox.mounted,'montado','sem cartao');$('ovLogger').textContent=yes(d.blackbox.logging_enabled,'ligado','pausado');$('ovFile').textContent=txt(d.blackbox.file);$('ovRecords').textContent=txt(d.blackbox.records);$('plPitch').textContent=num(d.imu.pitch_deg,' deg');$('plRoll').textContent=num(d.imu.roll_deg,' deg');$('plAlt').textContent='---- ft';$('plVario').textContent='---- fpm';$('plHdg').textContent='--- dg';$('plSpd').textContent='-- km/h';$('mtTheme').textContent=txt(d.meteo.theme);$('mtSummary').textContent=txt(d.meteo.summary);$('mtSensors').textContent=txt(d.sensors.summary);$('cmSsid').textContent=txt(d.wifi.ssid);$('cmPass').textContent=txt(d.wifi.password);$('cmIp').textContent=txt(d.wifi.ip);$('cmClients').textContent=txt(d.wifi.clients);$('cmNote').textContent=txt(d.wifi.note);$('cmLora').textContent=yes(d.comms.lora_enabled,'ON','OFF');$('cfScreen').textContent=txt(d.screen_label);$('cfMode').textContent=d.runtime_light?'leve':'normal';$('cfLogger').textContent=yes(d.blackbox.logging_enabled,'ligado','pausado');$('cfFile').textContent=txt(d.blackbox.file);$('cfRecords').textContent=txt(d.blackbox.records);$('cfSensors').textContent=txt(d.sensors.summary);}).catch(()=>{});}setTab('overview');refresh();setInterval(refresh,1800);</script>"));
+  client.print(F("<section class='section' id='section-meteo'><div class='split'><div class='card'><h3>Clima</h3><div class='big' id='mtTheme'>--</div><div class='muted' id='mtSummary'>--</div></div><div class='card'><h3>Altitude</h3><div class='big' id='mtAlt'>--</div><div class='muted'>estimada pela pressao do BME688</div></div><div class='card'><h3>Pressao</h3><div class='big' id='mtPress'>--</div><div class='muted'>leitura barometrica</div></div><div class='card'><h3>Temperatura</h3><div class='big' id='mtTemp'>--</div><div class='muted'>ambiente local</div></div><div class='card'><h3>Umidade</h3><div class='big' id='mtHum'>--</div><div class='muted'>umidade relativa</div></div></div></section>"));
+  client.print(F("<section class='section' id='section-comms'><div class='split'><div class='card'><h3>Rede</h3><div class='muted'>SSID: <span class='mono' id='cmSsid'>--</span><br>Senha: <span class='mono' id='cmPass'>--</span><br>IP: <span class='mono' id='cmIp'>--</span><br>Clientes: <span id='cmClients'>--</span><br>Hits web: <span id='cmHits'>--</span><br>Nota: <span id='cmNote'>--</span></div></div><div class='card'><h3>Mapa de integracao</h3><div class='muted'>Sensores: <span id='cmSensors'>--</span><br>Rotas: <span id='cmRoutes'>--</span><br>Scan I2C: <span class='mono' id='cmScan'>--</span><br>GPS: <span id='cmGps'>--</span><br>LoRa: <span id='cmLora'>--</span></div></div></div></section>"));
+  client.print(F("<section class='section' id='section-lora'><div class='split'><div class='card'><h3>Estado LoRa</h3><div class='big' id='lrState'>--</div><div class='muted'>UART: <span class='mono' id='lrBus'>--</span><br>AUX: <span id='lrAux'>--</span><br>RX bytes: <span id='lrRx'>--</span><br>TX bytes: <span id='lrTx'>--</span><br>Ultimo RX: <span id='lrLastRx'>--</span><br>Ultimo TX: <span id='lrLastTx'>--</span></div></div><div class='card'><h3>Teste rapido</h3><div class='muted'>Use o PING para validar envio pelo modulo serial. Se houver outra ponta ouvindo, ela deve receber o payload.</div><div class='actions'><button class='btn warn' onclick=\"act('lora=toggle')\">LoRa on/off</button><button class='btn small' onclick=\"act('lora_tx=ping')\">Enviar PING</button><button class='btn small' onclick=\"act('lora_tx=status')\">Enviar STATUS?</button></div><div class='footer' id='lrPlan'>--</div></div></div></section>"));
+  client.print(F("<section class='section' id='section-config'><div class='split'><div class='card'><h3>Config</h3><div class='muted'>Tela ativa: <span id='cfScreen'>--</span><br>Modo leve: <span id='cfMode'>--</span><br>Orientacao: <span id='cfOrientation'>--</span><br>Rotacao: <span id='cfRotation'>--</span><br>Logger: <span id='cfLogger'>--</span><br>Ultima escrita: <span id='cfLastLog'>--</span></div><div class='actions'><button class='btn small' onclick=\"act('screen=config')\">Abrir CONFIG</button><button class='btn small' onclick=\"act('logger=toggle')\">Pausar logger</button></div></div><div class='card'><h3>SD e sensores</h3><div class='muted'>Arquivo: <span class='mono' id='cfFile'>--</span><br>Registros: <span id='cfRecords'>--</span><br>Nota SD: <span id='cfNote'>--</span><br>Sensores: <span id='cfSensors'>--</span><br>Scan I2C: <span class='mono' id='cfScan'>--</span></div></div></div></section>"));
+  client.print(F("<section class='section' id='section-overview'><div class='grid'><div class='card'><h3>Uptime</h3><div class='big' id='ovUptime'>--</div><div class='muted'>Hits web: <span id='ovHits'>--</span><br>Clientes: <span id='ovClients'>--</span></div></div><div class='card'><h3>IMU</h3><div class='big' id='ovImu'>--</div><div class='muted'>Pitch: <span id='ovPitch'>--</span><br>Roll: <span id='ovRoll'>--</span><br>Temp: <span id='ovTemp'>--</span></div></div><div class='card'><h3>Touch</h3><div class='big' id='ovTouch'>--</div><div class='muted'>X/Y: <span id='ovTouchXY'>--</span><br>Toques: <span id='ovTouchCount'>--</span></div></div><div class='card'><h3>Blackbox</h3><div class='big' id='ovSd'>--</div><div class='muted'>Modo: <span id='ovLogger'>--</span><br>Arquivo: <span class='mono' id='ovFile'>--</span><br>Registros: <span id='ovRecords'>--</span></div></div></div></section>"));
+  client.print(F("<script>const $=i=>document.getElementById(i);const put=(i,v)=>{const e=$(i);if(e)e.textContent=v;};const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s;const txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v;const yes=(v,a='ON',b='OFF')=>v?a:b;function setTab(n){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+n));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===n));}function act(q){fetch('/api/action?'+q,{cache:'no-store'}).then(()=>setTimeout(refresh,220)).catch(()=>setTimeout(refresh,600));}function fmtMs(v){return(v===undefined||v===null||v===0)?'--':String(v)+' ms';}function refresh(){fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{put('heroAp',yes(d.wifi.ap,'AP ativo','AP offline'));put('heroIp','http://'+txt(d.wifi.ip));put('heroScreen',txt(d.screen_label));put('heroMode',d.runtime_light?'modo leve':'cockpit completo');put('labBmeState',d.meteo.connected?'BME OK':'BME OFF');put('labBmeAddr',d.sensors.scan.includes('0x77')?'0x77':(d.sensors.scan.includes('0x76')?'0x76':'--'));put('labBmeTemp',num(d.meteo.temperature_c,' C'));put('labBmeHum',num(d.meteo.humidity_pct,' %'));put('labBmePress',num(d.meteo.pressure_hpa,' hPa'));put('labBmeAlt',num(d.meteo.altitude_m,' m'));put('labBmeGas',num(d.meteo.gas_ohms,' ohms'));put('labBmeNote',txt(d.meteo.summary));put('labGpsState',d.gps.fix?'FIX OK':(d.gps.receiving?'NMEA RX':'GPS aguardando'));put('labGpsFix',d.gps.fix?('OK / '+txt(d.gps.sats)+' sats'):'sem fix');put('labGpsSats',txt(d.gps.sats));put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--');put('labGpsMotion',num(d.gps.alt_m,' m')+' / '+num(d.gps.speed_kmh,' km/h'));put('labGpsSentence',txt(d.gps.last_sentence));put('labGpsNote',txt(d.gps.note));put('labLoraState',d.lora.enabled?(d.lora.receiving?'RX ativo':'LoRa ON'):'LoRa OFF');put('labLoraAux',yes(d.lora.aux_high,'HIGH','LOW'));put('labLoraTraffic',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes));put('labLoraMsg',txt(d.lora.last_message));put('labLoraNote',txt(d.lora.note));put('mtTheme',txt(d.meteo.theme));put('mtSummary',txt(d.meteo.summary));put('mtTemp',num(d.meteo.temperature_c,' C'));put('mtHum',num(d.meteo.humidity_pct,' %'));put('mtPress',num(d.meteo.pressure_hpa,' hPa'));put('mtAlt',num(d.meteo.altitude_m,' m'));put('cmSsid',txt(d.wifi.ssid));put('cmPass',txt(d.wifi.password));put('cmIp',txt(d.wifi.ip));put('cmClients',txt(d.wifi.clients));put('cmHits',txt(d.wifi.web_hits));put('cmNote',txt(d.wifi.note));put('cmSensors',txt(d.sensors.summary));put('cmRoutes',txt(d.sensors.routes));put('cmScan',txt(d.sensors.scan));put('cmGps',d.gps.fix?('fix OK / '+txt(d.gps.sats)+' sats'):(d.gps.receiving?'recebendo NMEA':'sem trafego'));put('cmLora',d.lora.enabled?('ON / AUX '+yes(d.lora.aux_high,'HIGH','LOW')):'OFF');put('lrState',yes(d.lora.enabled,'ligado','desligado'));put('lrBus','UART TX17 RX18 | AUX6 | M0/1 7/8');put('lrAux',yes(d.lora.aux_high,'HIGH','LOW'));put('lrRx',txt(d.lora.rx_bytes));put('lrTx',txt(d.lora.tx_bytes));put('lrLastRx',fmtMs(d.lora.last_rx_ms));put('lrLastTx',fmtMs(d.lora.last_tx_ms));put('lrPlan',txt(d.lora.note));put('cfScreen',txt(d.screen_label));put('cfMode',d.runtime_light?'leve':'normal');put('cfOrientation',txt(d.ui.orientation));put('cfRotation',txt(d.ui.rotation));put('cfLogger',yes(d.blackbox.logging_enabled,'ligado','pausado'));put('cfLastLog',fmtMs(d.blackbox.last_log_ms));put('cfFile',txt(d.blackbox.file));put('cfRecords',txt(d.blackbox.records));put('cfNote',txt(d.blackbox.note));put('cfSensors',txt(d.sensors.known));put('cfScan',txt(d.sensors.scan));put('ovUptime',num(d.uptime_s,' s'));put('ovHits',txt(d.wifi.web_hits));put('ovClients',txt(d.wifi.clients));put('ovImu',d.imu.connected?(d.imu.healthy?'OK':'WARN'):'OFF');put('ovPitch',num(d.imu.pitch_deg,' deg'));put('ovRoll',num(d.imu.roll_deg,' deg'));put('ovTemp',num(d.imu.temperature_c,' C'));put('ovTouch',yes(d.touch.pressed,'ON','OFF'));put('ovTouchXY',txt(d.touch.x)+','+txt(d.touch.y));put('ovTouchCount',txt(d.touch.count));put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao'));put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado'));put('ovFile',txt(d.blackbox.file));put('ovRecords',txt(d.blackbox.records));}).catch(()=>{});}setTab('lab');refresh();setInterval(refresh,1800);</script>"));
   client.print(F("</div></body></html>"));
 }
 
@@ -1297,13 +2683,25 @@ static void handleWifiPortal()
 {
   const uint32_t now = millis();
 
-  if (g_wifi_mode_requested && !g_wifi_ap_started) {
-    startWifiPortal();
-  } else if (!g_wifi_mode_requested && g_wifi_ap_started) {
-    stopWifiPortal();
+  updateWifiRequestedFlag();
+  if (g_wifi_ap_requested && !g_wifi_ap_started && !g_wifi_apply_pending && (now - g_wifi_recover_request_ms) > 1200U) {
+    g_wifi_apply_pending = true;
+    g_wifi_recover_request_ms = now;
+    Serial.println("[WIFI] AP solicitado, mas inativo. Tentando subir novamente...");
+  }
+  if (g_wifi_apply_pending) {
+    if (g_wifi_mode_requested) {
+      startWifiPortal();
+    } else {
+      stopWifiPortal();
+    }
   }
 
-  if (!g_wifi_ap_started || !g_wifi_web_started) {
+  if (g_wifi_sta_requested && !g_wifi_sta_connected && g_wifi_sta_ssid[0] && (now - g_wifi_last_status_ms) >= WIFI_STATUS_SERIAL_MS) {
+    esp_wifi_connect();
+  }
+
+  if (!g_wifi_web_started) {
     return;
   }
 
@@ -1356,6 +2754,8 @@ static lv_obj_t *screenFromId(AppScreenId screen_id)
       return g_screen_meteo;
     case SCREEN_GPS:
       return g_screen_gps;
+    case SCREEN_LORA:
+      return g_screen_lora;
     case SCREEN_CONFIG:
       return g_screen_config;
     default:
@@ -1375,6 +2775,176 @@ static bool i2cAddressPresent(uint8_t addr)
   return ok;
 }
 
+static bool initBme688Sensor()
+{
+  Bme688State state = {};
+  state.i2c_addr = 0;
+
+  if (i2cAddressPresent(BME688_ADDR_PRIMARY)) {
+    state.i2c_addr = BME688_ADDR_PRIMARY;
+  } else if (i2cAddressPresent(BME688_ADDR_SECONDARY)) {
+    state.i2c_addr = BME688_ADDR_SECONDARY;
+  }
+
+  state.connected = state.i2c_addr != 0;
+  state.initialized = false;
+  state.reading_ok = false;
+  state.has_data = false;
+  state.last_update_ms = millis();
+
+  if (!state.connected) {
+    snprintf(state.note, sizeof(state.note), "BME688 nao detectado");
+    g_bme688_addr = 0;
+    g_bme688_initialized = false;
+    storeBme688State(state);
+    return false;
+  }
+
+  if (!lockI2C(pdMS_TO_TICKS(80))) {
+    snprintf(state.note, sizeof(state.note), "BME688 aguardando mutex I2C");
+    storeBme688State(state);
+    return false;
+  }
+
+  g_bme688.begin(state.i2c_addr, Wire);
+  const int8_t begin_status = g_bme688.checkStatus();
+  if (begin_status == BME68X_ERROR) {
+    unlockI2C();
+    snprintf(state.note, sizeof(state.note), "Erro init: %s", g_bme688.statusString().c_str());
+    g_bme688_addr = 0;
+    g_bme688_initialized = false;
+    storeBme688State(state);
+    Serial.printf("[BME688] Falha ao inicializar em 0x%02X: %s\n", state.i2c_addr, state.note);
+    return false;
+  }
+
+  g_bme688.setTPH();
+  g_bme688.setHeaterProf(BME688_HEATER_TEMP_C, BME688_HEATER_TIME_MS);
+  unlockI2C();
+
+  state.initialized = true;
+  g_bme688_addr = state.i2c_addr;
+  g_bme688_initialized = true;
+
+  if (begin_status == BME68X_WARNING) {
+    snprintf(state.note, sizeof(state.note), "Init com aviso @0x%02X", state.i2c_addr);
+  } else {
+    snprintf(state.note, sizeof(state.note), "BME688 pronto @0x%02X", state.i2c_addr);
+  }
+
+  storeBme688State(state);
+  Serial.printf("[BME688] Inicializado em 0x%02X\n", state.i2c_addr);
+  return true;
+}
+
+static void pollBme688Sensor()
+{
+  static uint32_t last_poll_ms = 0;
+  static uint8_t consecutive_failures = 0;
+  const uint32_t now = millis();
+
+  if ((now - last_poll_ms) < BME688_POLL_PERIOD_MS) {
+    return;
+  }
+  last_poll_ms = now;
+
+  if (!g_bme688_initialized) {
+    initBme688Sensor();
+    return;
+  }
+
+  uint32_t meas_dur_us = 0;
+  if (!lockI2C(pdMS_TO_TICKS(80))) {
+    return;
+  }
+
+  g_bme688.setOpMode(BME68X_FORCED_MODE);
+  meas_dur_us = g_bme688.getMeasDur();
+  unlockI2C();
+
+  if (meas_dur_us > 20000U) {
+    delay((meas_dur_us + 999U) / 1000U);
+  } else {
+    delayMicroseconds(meas_dur_us + 1000U);
+  }
+
+  bme68xData data = {};
+  bool ok = false;
+  uint8_t fetch_count = 0;
+  int8_t lib_status = BME68X_OK;
+  String status_text;
+  if (lockI2C(pdMS_TO_TICKS(80))) {
+    fetch_count = g_bme688.fetchData();
+    lib_status = g_bme688.checkStatus();
+    if (fetch_count > 0 && lib_status != BME68X_ERROR) {
+      g_bme688.getData(data);
+      ok = true;
+    }
+    status_text = g_bme688.statusString();
+    unlockI2C();
+  }
+
+  Bme688State state = copyBme688State();
+  state.connected = g_bme688_addr != 0;
+  state.initialized = g_bme688_initialized;
+  state.i2c_addr = g_bme688_addr;
+  state.last_update_ms = now;
+  state.reading_ok = ok;
+
+  if (ok) {
+    consecutive_failures = 0;
+    state.has_data = true;
+    state.temperature_c = data.temperature;
+    state.humidity_pct = data.humidity;
+    state.pressure_hpa = data.pressure / 100.0f;
+    state.altitude_m = pressureToAltitudeMeters(state.pressure_hpa);
+    state.gas_ohms = static_cast<float>(data.gas_resistance);
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        "T %.1fC | H %.1f%% | P %.1fhPa",
+        state.temperature_c,
+        state.humidity_pct,
+        state.pressure_hpa);
+    Serial.printf(
+        "[BME688] OK @0x%02X | T=%.1fC H=%.1f%% P=%.1fhPa Alt=%.1fm Gas=%.0fohm | fields=%u\n",
+        state.i2c_addr,
+        state.temperature_c,
+        state.humidity_pct,
+        state.pressure_hpa,
+        state.altitude_m,
+        state.gas_ohms,
+        static_cast<unsigned>(fetch_count));
+  } else {
+    if (consecutive_failures < 255U) {
+      consecutive_failures += 1U;
+    }
+    snprintf(
+        state.note,
+        sizeof(state.note),
+        fetch_count == 0
+            ? (status_text.length() ? "Sem dado novo: %s" : "Sem dado novo")
+            : (status_text.length() ? "Leitura falhou: %s" : "Leitura falhou"),
+        status_text.c_str());
+    Serial.printf(
+        "[BME688] FAIL @0x%02X | fetch=%u | status=%d | msg=%s\n",
+        state.i2c_addr,
+        static_cast<unsigned>(fetch_count),
+        static_cast<int>(lib_status),
+        status_text.length() ? status_text.c_str() : "sem mensagem");
+
+    if (consecutive_failures >= 3U) {
+      g_bme688_initialized = false;
+      state.initialized = false;
+      snprintf(state.note, sizeof(state.note), "BME688 falhou repetido. Tentando reinicializar...");
+      Serial.println("[BME688] Muitas falhas seguidas. Reinicializacao agendada.");
+      consecutive_failures = 0;
+    }
+  }
+
+  storeBme688State(state);
+}
+
 static String formatKnownSensorSummary()
 {
   struct KnownSensor
@@ -1389,9 +2959,7 @@ static String formatKnownSensorSummary()
       {"QMI8658 IMU", 0x6B, 0x6A},
       {"BME688", 0x77, 0x76},
       {"BMP581", 0x47, 0x46},
-      {"BMM350", 0x14, 0xFF},
-      {"LTR390UV", 0x53, 0xFF},
-      {"MAX17048", 0x36, 0xFF}};
+      {"BMM350", 0x14, 0xFF}};
 
   String result;
   result.reserve(320);
@@ -1452,19 +3020,48 @@ static String formatCompactSensorSummary(const String &scan)
   const bool bme_ok = scanHasAddress(scan, 0x77) || scanHasAddress(scan, 0x76);
   const bool bmp_ok = scanHasAddress(scan, 0x47) || scanHasAddress(scan, 0x46);
   const bool bmm_ok = scanHasAddress(scan, 0x14);
-  const bool uv_ok = scanHasAddress(scan, 0x53);
-  const bool bat_ok = scanHasAddress(scan, 0x36);
-  const uint8_t meteo_ok = (bme_ok ? 1U : 0U) + (bmp_ok ? 1U : 0U) + (bmm_ok ? 1U : 0U) + (uv_ok ? 1U : 0U);
 
   char buffer[128];
   snprintf(
       buffer,
       sizeof(buffer),
-      "Touch %s | IMU %s\nMeteo %u/4 | Bat %s",
-      touch_ok ? "OK" : "--",
+      "PLANE IMU %s BMP %s MAG %s\nMETEO BME %s",
       imu_ok ? "OK" : "--",
-      static_cast<unsigned>(meteo_ok),
-      bat_ok ? "OK" : "--");
+      bmp_ok ? "OK" : "--",
+      bmm_ok ? "OK" : "--",
+      bme_ok ? "OK" : "--");
+  return String(buffer);
+}
+
+static String formatBoschSensorMap(const String &scan)
+{
+  const bool bme_ok = scanHasAddress(scan, 0x77) || scanHasAddress(scan, 0x76);
+  const bool bmp_ok = scanHasAddress(scan, 0x47) || scanHasAddress(scan, 0x46);
+  const bool bmm_ok = scanHasAddress(scan, 0x14);
+
+  char buffer[384];
+  snprintf(
+      buffer,
+      sizeof(buffer),
+      "BME688 %s -> METEO / ar\nBMP581 %s -> METEO + PLANE\nBMM350 %s -> PLANE / heading",
+      bme_ok ? "OK" : "--",
+      bmp_ok ? "OK" : "--",
+      bmm_ok ? "OK" : "--");
+  return String(buffer);
+}
+
+static String formatRouteIntegrationSummary(const String &scan)
+{
+  const bool touch_ok = scanHasAddress(scan, 0x38);
+  const bool imu_ok = scanHasAddress(scan, 0x6B) || scanHasAddress(scan, 0x6A);
+
+  char buffer[320];
+  snprintf(
+      buffer,
+      sizeof(buffer),
+      "Touch %s -> UI\nIMU %s -> PLANE\nGPS UART43/44 -> COMMS + PLANE\nLoRa UART17/18 M0/1=7/8 AUX6 -> COMMS + LORA\nCDC USB/JTAG -> CONFIG",
+      touch_ok ? "OK" : "--",
+      imu_ok ? "OK" : "--");
   return String(buffer);
 }
 
@@ -1474,6 +3071,8 @@ static void refreshSensorCaches()
   g_sensor_raw_scan_cache = scanI2C();
   g_sensor_compact_cache = formatCompactSensorSummary(g_sensor_raw_scan_cache);
   g_sensor_scan_compact_cache = compactScanLine(g_sensor_raw_scan_cache);
+  g_sensor_bosch_cache = formatBoschSensorMap(g_sensor_raw_scan_cache);
+  g_sensor_route_cache = formatRouteIntegrationSummary(g_sensor_raw_scan_cache);
 }
 
 static String scanI2C()
@@ -1486,6 +3085,11 @@ static String scanI2C()
   }
 
   for (uint8_t addr = 1; addr < 127; ++addr) {
+    // Skip reserved I2C ranges to avoid reporting bus-control addresses as sensors.
+    if (addr <= 0x07 || addr >= 0x78) {
+      continue;
+    }
+
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
       if (found > 0) {
@@ -1521,6 +3125,7 @@ static void unmountBlackboxStorage()
   closeBlackboxFile();
   SD.end();
   g_sd_spi.end();
+  clearBlackboxTail();
 }
 
 static void chooseBlackboxPath(char *path, size_t path_len)
@@ -1612,14 +3217,15 @@ static bool openBlackboxLog(BlackboxState *state)
 
   if (new_file || g_blackbox_file.size() == 0) {
     g_blackbox_file.println(
-        "ms,imu_ok,pitch_deg,roll_deg,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,temp_c,touch_count,gps_fix,gps_lat,gps_lon,gps_alt_m,gps_speed_kmh,gps_sats");
+        "ms,imu_ok,pitch_deg,roll_deg,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,temp_c,touch_count,gps_fix,gps_lat,gps_lon,gps_alt_m,gps_speed_kmh,gps_sats,bme_temp_c,bme_hum_pct,bme_press_hpa,bme_alt_m,bme_gas_ohm");
     g_blackbox_file.flush();
   }
 
   snprintf(state->file_path, sizeof(state->file_path), "%s", path);
   state->file_open = true;
   state->records_written = 0;
-  snprintf(state->note, sizeof(state->note), "Gravando IMU. GPS reservado para proxima etapa");
+  clearBlackboxTail();
+  snprintf(state->note, sizeof(state->note), "Gravando IMU, GPS e BME688 para bancada.");
   return true;
 }
 
@@ -1630,12 +3236,14 @@ static bool appendBlackboxRecord(BlackboxState *state, uint32_t now_ms)
   }
 
   const ImuState imu = copyImuState();
+  const GpsState gps = copyGpsState();
+  const Bme688State bme = copyBme688State();
   const bool imu_ok = imu.connected && imu.healthy && imu.has_solution;
-  char line[256];
+  char line[BLACKBOX_TAIL_LINE_LEN];
   const int line_len = snprintf(
       line,
       sizeof(line),
-      "%lu,%u,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%lu,0,,,,,\n",
+      "%lu,%u,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%lu,%u,%.6f,%.6f,%.1f,%.1f,%u,%.2f,%.2f,%.2f,%.2f,%.0f\n",
       static_cast<unsigned long>(now_ms),
       imu_ok ? 1U : 0U,
       imu.pitch_deg,
@@ -1647,7 +3255,18 @@ static bool appendBlackboxRecord(BlackboxState *state, uint32_t now_ms)
       imu.gyro_dps[1],
       imu.gyro_dps[2],
       imu.temperature_c,
-      static_cast<unsigned long>(g_touch_press_count));
+      static_cast<unsigned long>(g_touch_press_count),
+      gps.has_fix ? 1U : 0U,
+      gps.has_location ? gps.latitude_deg : 0.0f,
+      gps.has_location ? gps.longitude_deg : 0.0f,
+      gps.has_fix ? gps.altitude_m : 0.0f,
+      gps.receiving ? gps.speed_kmh : 0.0f,
+      static_cast<unsigned>(gps.sats),
+      bme.has_data ? bme.temperature_c : 0.0f,
+      bme.has_data ? bme.humidity_pct : 0.0f,
+      bme.has_data ? bme.pressure_hpa : 0.0f,
+      bme.has_data ? bme.altitude_m : 0.0f,
+      bme.has_data ? bme.gas_ohms : 0.0f);
 
   if (line_len <= 0 || static_cast<size_t>(line_len) >= sizeof(line)) {
     snprintf(state->note, sizeof(state->note), "Falha ao montar linha CSV");
@@ -1666,6 +3285,7 @@ static bool appendBlackboxRecord(BlackboxState *state, uint32_t now_ms)
   state->records_written += 1;
   state->last_log_ms = now_ms;
   state->last_write_ok = true;
+  appendBlackboxTailLine(line);
   return true;
 }
 
@@ -1761,7 +3381,7 @@ static void initDisplay()
     fatalStop("[DISPLAY] Falha em g_panel->begin()");
   }
 
-  g_panel->setBrightness(255);
+  applyPanelBrightness(255);
   g_panel->fillScreen(COLOR_BLACK);
 
   Serial.println("[DISPLAY] begin() OK");
@@ -2210,6 +3830,7 @@ static void blackboxTask(void *parameter)
     if (g_sd_purge_requested) {
       g_sd_purge_requested = false;
       closeBlackboxFile();
+      clearBlackboxTail();
       state.file_open = false;
       state.records_written = 0;
       state.file_path[0] = '\0';
@@ -2497,12 +4118,6 @@ static void navigateEventCb(lv_event_t *e)
   }
 
   const AppScreenId screen_id = static_cast<AppScreenId>(reinterpret_cast<intptr_t>(lv_event_get_user_data(e)));
-
-  if (g_runtime_services_light && screen_id == SCREEN_METEO) {
-    Serial.println("[MODE] Saindo do modo Wi-Fi para abrir o painel METEO completo");
-    g_wifi_mode_requested = false;
-    stopWifiPortal();
-  }
 
   loadScreenById(screen_id);
 }
@@ -3057,6 +4672,7 @@ static void resetUiPointers()
   g_screen_efis = nullptr;
   g_screen_meteo = nullptr;
   g_screen_gps = nullptr;
+  g_screen_lora = nullptr;
   g_screen_config = nullptr;
   g_lbl_uptime = nullptr;
   g_lbl_i2c = nullptr;
@@ -3072,8 +4688,15 @@ static void resetUiPointers()
   g_lbl_plane_heading = nullptr;
   g_lbl_plane_speed = nullptr;
   g_lbl_plane_skydive = nullptr;
+  g_meteo_hero = nullptr;
+  g_meteo_panel = nullptr;
   g_lbl_meteo_theme = nullptr;
+  g_lbl_meteo_status = nullptr;
   g_lbl_meteo_cards = nullptr;
+  g_lbl_meteo_altitude = nullptr;
+  g_lbl_meteo_pressure = nullptr;
+  g_lbl_meteo_temperature = nullptr;
+  g_lbl_meteo_humidity = nullptr;
   g_lbl_comms_status = nullptr;
   g_lbl_comms_wifi = nullptr;
   g_lbl_comms_ble = nullptr;
@@ -3083,6 +4706,10 @@ static void resetUiPointers()
   g_lbl_comms_wifi_btn = nullptr;
   g_lbl_comms_lora_btn = nullptr;
   g_lbl_comms_rescan_btn = nullptr;
+  g_lbl_lora_status = nullptr;
+  g_lbl_lora_radio = nullptr;
+  g_lbl_lora_test = nullptr;
+  g_lbl_lora_toggle_btn = nullptr;
   g_lbl_home_hint = nullptr;
   g_lbl_config_orientation = nullptr;
   g_lbl_config_rotation = nullptr;
@@ -3096,11 +4723,14 @@ static void resetUiPointers()
   g_lbl_config_format_btn = nullptr;
   g_lbl_config_wifi_btn = nullptr;
   g_lbl_config_lora_btn = nullptr;
+  g_lbl_config_brightness = nullptr;
+  g_lbl_config_cdc = nullptr;
 }
 
 static void createConfigScreen();
 static void createMeteoScreen();
 static void createCommsScreen();
+static void createLoraScreen();
 static void createUI(AppScreenId initial_screen_id);
 
 static void rebuildUI(AppScreenId target_screen_id)
@@ -3109,6 +4739,7 @@ static void rebuildUI(AppScreenId target_screen_id)
   lv_obj_t *old_efis = g_screen_efis;
   lv_obj_t *old_meteo = g_screen_meteo;
   lv_obj_t *old_gps = g_screen_gps;
+  lv_obj_t *old_lora = g_screen_lora;
   lv_obj_t *old_config = g_screen_config;
 
   resetUiPointers();
@@ -3125,6 +4756,9 @@ static void rebuildUI(AppScreenId target_screen_id)
   }
   if (old_gps) {
     lv_obj_delete(old_gps);
+  }
+  if (old_lora) {
+    lv_obj_delete(old_lora);
   }
   if (old_config) {
     lv_obj_delete(old_config);
@@ -3173,15 +4807,15 @@ static void toggleWifiEventCb(lv_event_t *e)
     return;
   }
 
-  g_wifi_mode_requested = !g_wifi_mode_requested;
-  if (g_wifi_mode_requested) {
+  const bool next_ap_state = !g_wifi_ap_requested;
+  if (next_ap_state) {
     g_sd_purge_armed = false;
     loadScreenById(SCREEN_GPS);
     Serial.println("[WIFI] Pedido para ligar o AP via UI");
   } else {
     Serial.println("[WIFI] Pedido para desligar o AP via UI");
   }
-  updateRuntimeServiceMode();
+  requestWifiMode(next_ap_state, "ui");
 }
 
 static void toggleLoraEventCb(lv_event_t *e)
@@ -3190,10 +4824,28 @@ static void toggleLoraEventCb(lv_event_t *e)
     return;
   }
 
-  g_lora_enabled = !g_lora_enabled;
-  Serial.printf(
-      "[LORA] Estado alterado para %s (backend de radio ainda pendente nesta etapa)\n",
-      g_lora_enabled ? "ON" : "OFF");
+  requestLoraMode(!g_lora_enabled, "ui");
+}
+
+static void openLoraScreenEventCb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  loadScreenById(SCREEN_LORA);
+}
+
+static void backToCommsEventCb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  g_sd_purge_armed = false;
+  if (g_current_screen_id != SCREEN_GPS) {
+    loadScreenById(SCREEN_GPS);
+  }
 }
 
 static void rescanCommsEventCb(lv_event_t *e)
@@ -3215,6 +4867,26 @@ static void toggleBlackboxEventCb(lv_event_t *e)
   }
 
   g_blackbox_enabled_target = !g_blackbox_enabled_target;
+}
+
+static void brightnessDownEventCb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  applyPanelBrightness(static_cast<uint8_t>(g_display_brightness > 40 ? g_display_brightness - 24 : 24));
+  Serial.printf("[DISPLAY] Brilho ajustado para %u\n", static_cast<unsigned>(g_display_brightness));
+}
+
+static void brightnessUpEventCb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  applyPanelBrightness(static_cast<uint8_t>(g_display_brightness < 231 ? g_display_brightness + 24 : 255));
+  Serial.printf("[DISPLAY] Brilho ajustado para %u\n", static_cast<unsigned>(g_display_brightness));
 }
 
 static void purgeSdLogsEventCb(lv_event_t *e)
@@ -3255,7 +4927,7 @@ static void createConfigScreen()
   const int32_t top_y = landscape ? 52 : 60;
   const lv_coord_t full_w = uiWidth() - 16;
   const lv_coord_t bottom_btn_h = 42;
-  const lv_coord_t net_h = landscape ? 140 : 148;
+  const lv_coord_t net_h = landscape ? 146 : 148;
 
   g_screen_config = lv_obj_create(nullptr);
   styleScreen(g_screen_config);
@@ -3265,9 +4937,9 @@ static void createConfigScreen()
 
   const lv_coord_t left_w = landscape ? 172 : full_w;
   const lv_coord_t right_w = landscape ? (uiWidth() - left_w - 32) : full_w;
-  const lv_coord_t system_h = 96;
+  const lv_coord_t system_h = landscape ? 172 : 182;
   const lv_coord_t storage_h = landscape ? 168 : 128;
-  const lv_coord_t sensor_h = landscape ? 72 : 88;
+  const lv_coord_t sensor_h = landscape ? 96 : 108;
   const lv_coord_t portrait_net_y = top_y + system_h + 8;
   const lv_coord_t portrait_storage_y = portrait_net_y + net_h + 8;
   const lv_coord_t portrait_sensor_y = portrait_storage_y + storage_h + 8;
@@ -3297,17 +4969,41 @@ static void createConfigScreen()
   lv_obj_set_style_text_color(g_lbl_config_rotation, lv_color_hex(0xC9D4E5), 0);
   lv_obj_align(g_lbl_config_rotation, LV_ALIGN_TOP_LEFT, 0, 42);
 
-  lv_obj_t *orientation_box = lv_obj_create(display_card);
-  lv_obj_set_size(orientation_box, left_w - 20, 34);
-  lv_obj_align(orientation_box, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_set_style_bg_color(orientation_box, lv_color_hex(0x1A2638), 0);
-  lv_obj_set_style_border_width(orientation_box, 0, 0);
-  lv_obj_set_style_radius(orientation_box, 12, 0);
-  lv_obj_clear_flag(orientation_box, LV_OBJ_FLAG_SCROLLABLE);
+  g_lbl_config_brightness = lv_label_create(display_card);
+  lv_label_set_text(g_lbl_config_brightness, "Brilho: 255");
+  lv_obj_set_style_text_color(g_lbl_config_brightness, lv_color_hex(0xFFF2C2), 0);
+  lv_obj_align(g_lbl_config_brightness, LV_ALIGN_TOP_LEFT, 0, 64);
 
-  lv_obj_t *portrait_label = lv_label_create(orientation_box);
-  lv_label_set_text(portrait_label, "Rotacao travada");
-  lv_obj_center(portrait_label);
+  g_lbl_config_cdc = lv_label_create(display_card);
+  lv_label_set_text(g_lbl_config_cdc, "CDC: USB serial 115200");
+  lv_label_set_long_mode(g_lbl_config_cdc, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_lbl_config_cdc, left_w - 20);
+  lv_obj_set_style_text_color(g_lbl_config_cdc, lv_color_hex(0xC9D4E5), 0);
+  lv_obj_align(g_lbl_config_cdc, LV_ALIGN_TOP_LEFT, 0, 88);
+
+  const lv_coord_t display_btn_w = (left_w - 28) / 2;
+
+  lv_obj_t *brightness_down_btn = lv_button_create(display_card);
+  lv_obj_set_size(brightness_down_btn, display_btn_w, 34);
+  lv_obj_align(brightness_down_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(brightness_down_btn, lv_color_hex(0x31404F), 0);
+  lv_obj_set_style_radius(brightness_down_btn, 12, 0);
+  lv_obj_add_event_cb(brightness_down_btn, brightnessDownEventCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *brightness_down_label = lv_label_create(brightness_down_btn);
+  lv_label_set_text(brightness_down_label, "Brilho -");
+  lv_obj_center(brightness_down_label);
+
+  lv_obj_t *brightness_up_btn = lv_button_create(display_card);
+  lv_obj_set_size(brightness_up_btn, display_btn_w, 34);
+  lv_obj_align(brightness_up_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_set_style_bg_color(brightness_up_btn, lv_color_hex(0x765529), 0);
+  lv_obj_set_style_radius(brightness_up_btn, 12, 0);
+  lv_obj_add_event_cb(brightness_up_btn, brightnessUpEventCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *brightness_up_label = lv_label_create(brightness_up_btn);
+  lv_label_set_text(brightness_up_label, "Brilho +");
+  lv_obj_center(brightness_up_label);
 
   lv_obj_t *net_card = lv_obj_create(g_screen_config);
   lv_obj_set_size(net_card, right_w, net_h);
@@ -3486,6 +5182,10 @@ static void createMeteoScreen()
 {
   const bool landscape = isLandscapeUI();
   const int32_t top_y = landscape ? 64 : 70;
+  const lv_coord_t hero_h = landscape ? 98 : 106;
+  const lv_coord_t panel_y = top_y + hero_h + 8;
+  const lv_coord_t panel_h = uiHeight() - panel_y - 60;
+  const lv_coord_t panel_w = uiWidth() - 16;
 
   g_screen_meteo = lv_obj_create(nullptr);
   styleScreen(g_screen_meteo);
@@ -3494,42 +5194,54 @@ static void createMeteoScreen()
   lv_obj_set_style_bg_grad_dir(g_screen_meteo, LV_GRAD_DIR_VER, 0);
   createHeader(g_screen_meteo, "METEO", "tempo e clima");
 
-  lv_obj_t *hero = lv_obj_create(g_screen_meteo);
-  lv_obj_clear_flag(hero, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_size(hero, uiWidth() - 16, landscape ? 110 : 132);
-  lv_obj_align(hero, LV_ALIGN_TOP_MID, 0, top_y);
-  lv_obj_set_style_bg_color(hero, lv_color_hex(0x174C77), 0);
-  lv_obj_set_style_bg_grad_color(hero, lv_color_hex(0x03131E), 0);
-  lv_obj_set_style_bg_grad_dir(hero, LV_GRAD_DIR_VER, 0);
-  lv_obj_set_style_border_color(hero, lv_color_hex(0x6FD9FF), 0);
-  lv_obj_set_style_border_width(hero, 2, 0);
-  lv_obj_set_style_radius(hero, 18, 0);
-  lv_obj_set_style_pad_all(hero, 14, 0);
+  g_meteo_hero = lv_obj_create(g_screen_meteo);
+  lv_obj_clear_flag(g_meteo_hero, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(g_meteo_hero, uiWidth() - 16, hero_h);
+  lv_obj_align(g_meteo_hero, LV_ALIGN_TOP_MID, 0, top_y);
+  lv_obj_set_style_bg_color(g_meteo_hero, lv_color_hex(0x174C77), 0);
+  lv_obj_set_style_bg_grad_color(g_meteo_hero, lv_color_hex(0x03131E), 0);
+  lv_obj_set_style_bg_grad_dir(g_meteo_hero, LV_GRAD_DIR_VER, 0);
+  lv_obj_set_style_border_color(g_meteo_hero, lv_color_hex(0x6FD9FF), 0);
+  lv_obj_set_style_border_width(g_meteo_hero, 2, 0);
+  lv_obj_set_style_radius(g_meteo_hero, 18, 0);
+  lv_obj_set_style_pad_all(g_meteo_hero, 14, 0);
 
-  g_lbl_meteo_theme = lv_label_create(hero);
-  lv_label_set_text(g_lbl_meteo_theme, "Tema atual: ceu limpo / dia\nDepois: dia, noite, chuva, nublado, tempestade");
+g_lbl_meteo_theme = lv_label_create(g_meteo_hero);
+lv_label_set_text(g_lbl_meteo_theme, "AGUARDANDO");
   lv_label_set_long_mode(g_lbl_meteo_theme, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(g_lbl_meteo_theme, uiWidth() - 48);
   lv_obj_set_style_text_color(g_lbl_meteo_theme, lv_color_hex(0xF2FAFF), 0);
   lv_obj_align(g_lbl_meteo_theme, LV_ALIGN_TOP_LEFT, 0, 0);
 
-  lv_obj_t *cards = lv_obj_create(g_screen_meteo);
-  lv_obj_set_size(cards, uiWidth() - 16, uiHeight() - top_y - (landscape ? 176 : 214));
-  lv_obj_align(cards, LV_ALIGN_TOP_MID, 0, top_y + (landscape ? 118 : 140));
-  lv_obj_set_style_bg_color(cards, lv_color_hex(0x09131C), 0);
-  lv_obj_set_style_border_color(cards, lv_color_hex(0x3CCB9A), 0);
-  lv_obj_set_style_border_width(cards, 2, 0);
-  lv_obj_set_style_radius(cards, 18, 0);
-  lv_obj_set_style_pad_all(cards, 14, 0);
+g_lbl_meteo_status = lv_label_create(g_meteo_hero);
+lv_label_set_text(g_lbl_meteo_status, "BME688 preparando a inferencia local do clima.");
+  lv_label_set_long_mode(g_lbl_meteo_status, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_lbl_meteo_status, uiWidth() - 48);
+  lv_obj_set_style_text_color(g_lbl_meteo_status, lv_color_hex(0xEAF7FF), 0);
+  lv_obj_align(g_lbl_meteo_status, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
-  g_lbl_meteo_cards = lv_label_create(cards);
-  lv_label_set_text(
-      g_lbl_meteo_cards,
-      "TEMP\n--.- C\n\nUMIDADE\n--.- %\n\nPRESSAO\n---- hPa\n\nUV/LUX\n-- / ---\n\nAR\nBME688 pendente");
-  lv_label_set_long_mode(g_lbl_meteo_cards, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(g_lbl_meteo_cards, uiWidth() - 48);
-  lv_obj_set_style_text_color(g_lbl_meteo_cards, lv_color_hex(0xE9F7F4), 0);
-  lv_obj_align(g_lbl_meteo_cards, LV_ALIGN_TOP_LEFT, 0, 0);
+  g_meteo_panel = lv_obj_create(g_screen_meteo);
+  lv_obj_set_size(g_meteo_panel, panel_w, panel_h);
+  lv_obj_align(g_meteo_panel, LV_ALIGN_TOP_MID, 0, panel_y);
+  lv_obj_set_style_bg_color(g_meteo_panel, lv_color_hex(0x09131C), 0);
+  lv_obj_set_style_border_color(g_meteo_panel, lv_color_hex(0x3CCB9A), 0);
+  lv_obj_set_style_border_width(g_meteo_panel, 2, 0);
+  lv_obj_set_style_radius(g_meteo_panel, 18, 0);
+  lv_obj_set_style_pad_all(g_meteo_panel, 14, 0);
+
+  g_lbl_meteo_cards = lv_label_create(g_meteo_panel);
+  lv_label_set_text(g_lbl_meteo_cards, "CLIMA");
+  lv_obj_add_flag(g_lbl_meteo_cards, LV_OBJ_FLAG_HIDDEN);
+
+  const lv_coord_t gap = 8;
+  const lv_coord_t card_w = (panel_w - 28 - gap) / 2;
+  const lv_coord_t card_h = landscape ? 76 : 92;
+  const lv_coord_t row2_y = card_h + gap;
+
+  createDataCard(g_meteo_panel, card_w, card_h, LV_ALIGN_TOP_LEFT, 0, 0, 0x7BD7FF, "ALTITUDE", "--- m", &g_lbl_meteo_altitude);
+  createDataCard(g_meteo_panel, card_w, card_h, LV_ALIGN_TOP_RIGHT, 0, 0, 0xF7C768, "PRESSAO", "---- hPa", &g_lbl_meteo_pressure);
+  createDataCard(g_meteo_panel, card_w, card_h, LV_ALIGN_TOP_LEFT, 0, row2_y, 0xFF8A65, "TEMP", "--.- C", &g_lbl_meteo_temperature);
+  createDataCard(g_meteo_panel, card_w, card_h, LV_ALIGN_TOP_RIGHT, 0, row2_y, 0x6BE4C8, "UMIDADE", "--.- %", &g_lbl_meteo_humidity);
 
   createBackButton(g_screen_meteo, LV_ALIGN_BOTTOM_MID, 0, -10, uiWidth() - 32);
 }
@@ -3590,10 +5302,96 @@ static void createCommsScreen()
   const lv_coord_t button_y = landscape ? (cards_y + (card_h * 2) + 16) : (cards_y + 182);
 
   createActionButton(g_screen_gps, button_w, button_h, LV_ALIGN_TOP_LEFT, 8, button_y, 0x285C92, "Wi-Fi AP", toggleWifiEventCb, &g_lbl_comms_wifi_btn);
-  createActionButton(g_screen_gps, button_w, button_h, LV_ALIGN_TOP_MID, 0, button_y, 0x8B3E2A, "LoRa", toggleLoraEventCb, &g_lbl_comms_lora_btn);
+  createActionButton(g_screen_gps, button_w, button_h, LV_ALIGN_TOP_MID, 0, button_y, 0x8B3E2A, "Menu LoRa", openLoraScreenEventCb, &g_lbl_comms_lora_btn);
   createActionButton(g_screen_gps, button_w, button_h, LV_ALIGN_TOP_RIGHT, -8, button_y, 0x2A5E4C, "Rescan", rescanCommsEventCb, &g_lbl_comms_rescan_btn);
 
   createBackButton(g_screen_gps, LV_ALIGN_BOTTOM_MID, 0, -10, uiWidth() - 32);
+}
+
+static void createLoraScreen()
+{
+  const bool landscape = isLandscapeUI();
+  const int32_t top_y = landscape ? 64 : 70;
+  const lv_coord_t screen_w = uiWidth();
+  const lv_coord_t card_w = screen_w - 16;
+  const lv_coord_t hero_h = landscape ? 82 : 88;
+  const lv_coord_t info_h = landscape ? 86 : 94;
+  const lv_coord_t test_h = landscape ? 74 : 82;
+  const lv_coord_t second_y = top_y + hero_h + 8;
+  const lv_coord_t third_y = second_y + info_h + 8;
+  const lv_coord_t action_y = third_y + test_h + 12;
+  const lv_coord_t action_w = (screen_w - 28) / 2;
+
+  g_screen_lora = lv_obj_create(nullptr);
+  styleScreen(g_screen_lora);
+  lv_obj_set_style_bg_color(g_screen_lora, lv_color_hex(0x090B10), 0);
+  lv_obj_set_style_bg_grad_color(g_screen_lora, lv_color_hex(0x25130D), 0);
+  lv_obj_set_style_bg_grad_dir(g_screen_lora, LV_GRAD_DIR_VER, 0);
+  createHeader(g_screen_lora, "LORA", "radio e telemetria");
+
+  lv_obj_t *hero = lv_obj_create(g_screen_lora);
+  lv_obj_clear_flag(hero, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(hero, card_w, hero_h);
+  lv_obj_align(hero, LV_ALIGN_TOP_MID, 0, top_y);
+  lv_obj_set_style_bg_color(hero, lv_color_hex(0x141821), 0);
+  lv_obj_set_style_border_color(hero, lv_color_hex(0xFF7A59), 0);
+  lv_obj_set_style_border_width(hero, 2, 0);
+  lv_obj_set_style_radius(hero, 18, 0);
+  lv_obj_set_style_pad_all(hero, 14, 0);
+
+  g_lbl_lora_status = lv_label_create(hero);
+  lv_label_set_text(g_lbl_lora_status, "LoRa UART OFF\nPinos 17/18/6/7/8 prontos");
+  lv_label_set_long_mode(g_lbl_lora_status, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_lbl_lora_status, card_w - 28);
+  lv_obj_set_style_text_color(g_lbl_lora_status, lv_color_hex(0xFFF2DA), 0);
+  lv_obj_align(g_lbl_lora_status, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t *radio_card = lv_obj_create(g_screen_lora);
+  lv_obj_clear_flag(radio_card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(radio_card, card_w, info_h);
+  lv_obj_align(radio_card, LV_ALIGN_TOP_MID, 0, second_y);
+  lv_obj_set_style_bg_color(radio_card, lv_color_hex(0x0F1218), 0);
+  lv_obj_set_style_border_color(radio_card, lv_color_hex(0xD48E5C), 0);
+  lv_obj_set_style_border_width(radio_card, 2, 0);
+  lv_obj_set_style_radius(radio_card, 18, 0);
+  lv_obj_set_style_pad_all(radio_card, 14, 0);
+
+  g_lbl_lora_radio = lv_label_create(radio_card);
+  lv_label_set_text(g_lbl_lora_radio, "Radio: E220 UART\nTX=17 RX=18 | M0=7 M1=8\nAUX=6 | modo inicial = normal");
+  lv_label_set_long_mode(g_lbl_lora_radio, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_lbl_lora_radio, card_w - 28);
+  lv_obj_set_style_text_color(g_lbl_lora_radio, lv_color_hex(0xE7EDF5), 0);
+  lv_obj_align(g_lbl_lora_radio, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  lv_obj_t *test_card = lv_obj_create(g_screen_lora);
+  lv_obj_clear_flag(test_card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_size(test_card, card_w, test_h);
+  lv_obj_align(test_card, LV_ALIGN_TOP_MID, 0, third_y);
+  lv_obj_set_style_bg_color(test_card, lv_color_hex(0x0B1118), 0);
+  lv_obj_set_style_border_color(test_card, lv_color_hex(0x53C2A3), 0);
+  lv_obj_set_style_border_width(test_card, 2, 0);
+  lv_obj_set_style_radius(test_card, 18, 0);
+  lv_obj_set_style_pad_all(test_card, 14, 0);
+
+  g_lbl_lora_test = lv_label_create(test_card);
+  lv_label_set_text(g_lbl_lora_test, "Proximo passo:\n1. M0=0 M1=0\n2. ligar dois modulos\n3. validar TX/RX via UART");
+  lv_label_set_long_mode(g_lbl_lora_test, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_lbl_lora_test, card_w - 28);
+  lv_obj_set_style_text_color(g_lbl_lora_test, lv_color_hex(0xD5F3EA), 0);
+  lv_obj_align(g_lbl_lora_test, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  createActionButton(g_screen_lora, action_w, 42, LV_ALIGN_TOP_LEFT, 8, action_y, 0x8B3E2A, "Ligar LoRa", toggleLoraEventCb, &g_lbl_lora_toggle_btn);
+
+  lv_obj_t *back_btn = lv_button_create(g_screen_lora);
+  lv_obj_set_size(back_btn, action_w, 42);
+  lv_obj_align(back_btn, LV_ALIGN_TOP_RIGHT, -8, action_y);
+  lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2B4C73), 0);
+  lv_obj_set_style_radius(back_btn, 14, 0);
+  lv_obj_add_event_cb(back_btn, backToCommsEventCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *back_label = lv_label_create(back_btn);
+  lv_label_set_text(back_label, "Voltar COMMS");
+  lv_obj_center(back_label);
 }
 
 static void createMainScreen()
@@ -3672,6 +5470,7 @@ static void createUI(AppScreenId initial_screen_id)
   createEfisScreen();
   createMeteoScreen();
   createCommsScreen();
+  createLoraScreen();
   createConfigScreen();
 
   createMainScreen();
@@ -3712,6 +5511,8 @@ static void refreshEfisUI()
   }
 
   const ImuState imu = copyImuState();
+  const bool bmp_ok = scanHasAddress(g_sensor_raw_scan_cache, 0x47) || scanHasAddress(g_sensor_raw_scan_cache, 0x46);
+  const bool bmm_ok = scanHasAddress(g_sensor_raw_scan_cache, 0x14);
   ImuState display_imu = imu;
   float pitch_trim_deg = 0.0f;
   float roll_trim_deg = 0.0f;
@@ -3766,7 +5567,13 @@ static void refreshEfisUI()
   }
 
   if (g_lbl_plane_skydive) {
-    lv_label_set_text(g_lbl_plane_skydive, "SKYDIVE em breve");
+    const GpsState gps = copyGpsState();
+    lv_label_set_text_fmt(
+        g_lbl_plane_skydive,
+        "BMP581 %s | BMM350 %s | GPS %s",
+        bmp_ok ? "OK" : "--",
+        bmm_ok ? "OK" : "--",
+        gps.receiving ? (gps.has_fix ? "FIX" : "RX") : "--");
   }
 
   if (g_lbl_efis_status) {
@@ -3777,11 +5584,15 @@ static void refreshEfisUI()
     } else if (g_runtime_services_light) {
       lv_label_set_text_fmt(
           g_lbl_efis_status,
-          "IMU OK | Wi-Fi ativo | trim %.1f/%.1f",
-          pitch_trim_deg,
-          roll_trim_deg);
+          "IMU OK | BMP %s | MAG %s | Wi-Fi ativo",
+          bmp_ok ? "OK" : "--",
+          bmm_ok ? "OK" : "--");
     } else if (!imu.has_solution) {
-      lv_label_set_text(g_lbl_efis_status, "IMU alinhando");
+      lv_label_set_text_fmt(
+          g_lbl_efis_status,
+          "IMU alinhando | BMP %s | MAG %s",
+          bmp_ok ? "OK" : "--",
+          bmm_ok ? "OK" : "--");
     } else if (!g_lbl_efis_pitch && !g_lbl_efis_roll) {
       lv_label_set_text_fmt(
           g_lbl_efis_status,
@@ -3791,10 +5602,10 @@ static void refreshEfisUI()
     } else {
       lv_label_set_text_fmt(
           g_lbl_efis_status,
-          "IMU OK | %.1f C | trim %.1f/%.1f",
-          imu.temperature_c,
-          pitch_trim_deg,
-          roll_trim_deg);
+          "IMU OK | BMP %s | MAG %s | %.1f C",
+          bmp_ok ? "OK" : "--",
+          bmm_ok ? "OK" : "--",
+          imu.temperature_c);
     }
   }
 
@@ -3807,31 +5618,53 @@ static void refreshConfigUI()
 {
   const BlackboxState blackbox = copyBlackboxState();
   char ip_text[20];
+  char ap_ip_text[20];
+  char sta_ip_text[20];
   formatWifiVisibleIp(ip_text, sizeof(ip_text));
+  formatWifiApIp(ap_ip_text, sizeof(ap_ip_text));
+  formatWifiStaIp(sta_ip_text, sizeof(sta_ip_text));
 
   if (g_sd_purge_armed && (millis() - g_sd_purge_arm_ms) > SD_PURGE_CONFIRM_MS) {
     g_sd_purge_armed = false;
   }
 
   if (g_lbl_config_orientation) {
-    lv_label_set_text(g_lbl_config_orientation, "Modo: Vertical");
+    lv_label_set_text_fmt(g_lbl_config_orientation, "Modo: %s", orientationModeLabel(g_orientation_mode));
   }
 
   if (g_lbl_config_rotation) {
     lv_label_set_text_fmt(g_lbl_config_rotation, "Ativa: %s", rotationLabel(g_display_rotation));
   }
 
+  if (g_lbl_config_brightness) {
+    lv_label_set_text_fmt(g_lbl_config_brightness, "Brilho: %u / 255", static_cast<unsigned>(g_display_brightness));
+  }
+
+  if (g_lbl_config_cdc) {
+    const GpsState gps = copyGpsState();
+    lv_label_set_text_fmt(
+        g_lbl_config_cdc,
+        "CDC: USB Serial/JTAG\nSerial: 115200 baud\nAP %s | LAN %s | LoRa %s | GPS %s",
+        g_wifi_ap_requested ? "ON" : "OFF",
+        g_wifi_sta_connected ? "OK" : (g_wifi_sta_requested ? "..." : "--"),
+        g_lora_enabled ? "ON" : "OFF",
+        gps.receiving ? "RX" : "--");
+  }
+
   if (g_lbl_config_net) {
-    char net_text[256];
+    char net_text[320];
     if (isLandscapeUI()) {
       snprintf(
           net_text,
           sizeof(net_text),
-          "WiFi AP: %s\nSSID: %s\nSenha: %s\nIP/URL: http://%s\nClientes: %u\nLoRa: %s\n%s",
+          "AP: %s | http://%s\nSSID: %s | Senha: %s\nLAN: %s | %s\nRede local: %s\nClientes AP: %u | LoRa: %s\n%s",
           wifiStateLabel(),
+          ap_ip_text,
           WIFI_AP_SSID,
           WIFI_AP_PASSWORD,
-          ip_text,
+          g_wifi_sta_connected ? "OK" : (g_wifi_sta_requested ? "..." : "--"),
+          g_wifi_sta_connected ? sta_ip_text : "--",
+          g_wifi_sta_ssid[0] ? g_wifi_sta_ssid : "-",
           static_cast<unsigned>(wifiClientCount()),
           g_lora_enabled ? "ON" : "OFF",
           g_wifi_diag_note);
@@ -3839,18 +5672,18 @@ static void refreshConfigUI()
       snprintf(
           net_text,
           sizeof(net_text),
-          "WiFi AP: %s\nSSID: %s\nSenha: %s\nIP: %s\nClientes: %u",
+          "AP: %s\nIP AP: %s\nLAN: %s\nIP LAN: %s\nSSID local: %s",
           wifiStateLabel(),
-          WIFI_AP_SSID,
-          WIFI_AP_PASSWORD,
-          ip_text,
-          static_cast<unsigned>(wifiClientCount()));
+          ap_ip_text,
+          g_wifi_sta_connected ? "OK" : (g_wifi_sta_requested ? "..." : "--"),
+          g_wifi_sta_connected ? sta_ip_text : "--",
+          g_wifi_sta_ssid[0] ? g_wifi_sta_ssid : "-");
     }
     lv_label_set_text(g_lbl_config_net, net_text);
   }
 
   if (g_lbl_config_sensors) {
-    lv_label_set_text(g_lbl_config_sensors, g_sensor_compact_cache.c_str());
+    lv_label_set_text(g_lbl_config_sensors, g_sensor_route_cache.c_str());
   }
 
   if (g_lbl_config_note) {
@@ -3904,7 +5737,7 @@ static void refreshConfigUI()
   }
 
   if (g_lbl_config_wifi_btn) {
-    lv_label_set_text(g_lbl_config_wifi_btn, g_wifi_mode_requested ? "Desligar Wi-Fi" : "Ligar Wi-Fi");
+    lv_label_set_text(g_lbl_config_wifi_btn, g_wifi_ap_requested ? "Desligar AP" : "Ligar AP");
   }
 
   if (g_lbl_config_lora_btn) {
@@ -3919,59 +5752,149 @@ static void refreshConfigUI()
         "IMU %s | SD %s\nWiFi %s @ %s | LoRa %s",
         g_imu_state.connected ? (g_imu_state.healthy ? "OK" : "WARN") : "--",
         blackbox.mounted ? "OK" : "--",
-        wifiStateLabel(),
+        wifiModeLabel(),
         ip_text,
         g_lora_enabled ? "on" : "off");
     lv_label_set_text(g_lbl_home_hint, home_text);
   }
 
   if (g_lbl_meteo_theme) {
-    const uint32_t hours = (millis() / 1000UL / 15UL) % 4UL;
-    switch (hours) {
+    const Bme688State bme_weather = copyBme688State();
+    char meteo_theme[48];
+    char meteo_summary[160];
+    const uint8_t weather_mode = classifyMeteoTheme(
+        bme_weather,
+        meteo_theme,
+        sizeof(meteo_theme),
+        meteo_summary,
+        sizeof(meteo_summary));
+
+    switch (weather_mode) {
       case 0:
-        lv_label_set_text(g_lbl_meteo_theme, "Tema atual: dia claro\nDepois: vincular a sensores, GPS ou web");
+        lv_label_set_text(g_lbl_meteo_theme, meteo_theme);
+        if (g_lbl_meteo_status) {
+          lv_label_set_text(g_lbl_meteo_status, meteo_summary);
+        }
+        if (g_screen_meteo) {
+          lv_obj_set_style_bg_color(g_screen_meteo, lv_color_hex(0x081B2D), 0);
+          lv_obj_set_style_bg_grad_color(g_screen_meteo, lv_color_hex(0x1D5B89), 0);
+        }
+        if (g_meteo_hero) {
+          lv_obj_set_style_bg_color(g_meteo_hero, lv_color_hex(0x2377B5), 0);
+          lv_obj_set_style_bg_grad_color(g_meteo_hero, lv_color_hex(0x0F2D45), 0);
+        }
+        if (g_meteo_panel) {
+          lv_obj_set_style_border_color(g_meteo_panel, lv_color_hex(0x6FD9FF), 0);
+        }
         break;
       case 1:
-        lv_label_set_text(g_lbl_meteo_theme, "Tema atual: nublado\nDepois: fundo reage ao tempo real");
+        lv_label_set_text(g_lbl_meteo_theme, meteo_theme);
+        if (g_lbl_meteo_status) {
+          lv_label_set_text(g_lbl_meteo_status, meteo_summary);
+        }
+        if (g_screen_meteo) {
+          lv_obj_set_style_bg_color(g_screen_meteo, lv_color_hex(0x0A121A), 0);
+          lv_obj_set_style_bg_grad_color(g_screen_meteo, lv_color_hex(0x324252), 0);
+        }
+        if (g_meteo_hero) {
+          lv_obj_set_style_bg_color(g_meteo_hero, lv_color_hex(0x4A5A67), 0);
+          lv_obj_set_style_bg_grad_color(g_meteo_hero, lv_color_hex(0x1B252D), 0);
+        }
+        if (g_meteo_panel) {
+          lv_obj_set_style_border_color(g_meteo_panel, lv_color_hex(0xA7C2D6), 0);
+        }
         break;
       case 2:
-        lv_label_set_text(g_lbl_meteo_theme, "Tema atual: chuva\nDepois: animacao leve de clima");
+        lv_label_set_text(g_lbl_meteo_theme, meteo_theme);
+        if (g_lbl_meteo_status) {
+          lv_label_set_text(g_lbl_meteo_status, meteo_summary);
+        }
+        if (g_screen_meteo) {
+          lv_obj_set_style_bg_color(g_screen_meteo, lv_color_hex(0x090C12), 0);
+          lv_obj_set_style_bg_grad_color(g_screen_meteo, lv_color_hex(0x2F213B), 0);
+        }
+        if (g_meteo_hero) {
+          lv_obj_set_style_bg_color(g_meteo_hero, lv_color_hex(0x3A2B4D), 0);
+          lv_obj_set_style_bg_grad_color(g_meteo_hero, lv_color_hex(0x151B28), 0);
+        }
+        if (g_meteo_panel) {
+          lv_obj_set_style_border_color(g_meteo_panel, lv_color_hex(0xF8CA5B), 0);
+        }
         break;
       default:
-        lv_label_set_text(g_lbl_meteo_theme, "Tema atual: noite\nDepois: dia/noite por hora real");
+        lv_label_set_text(g_lbl_meteo_theme, meteo_theme);
+        if (g_lbl_meteo_status) {
+          lv_label_set_text(g_lbl_meteo_status, meteo_summary);
+        }
+        if (g_screen_meteo) {
+          lv_obj_set_style_bg_color(g_screen_meteo, lv_color_hex(0x08111B), 0);
+          lv_obj_set_style_bg_grad_color(g_screen_meteo, lv_color_hex(0x163246), 0);
+        }
+        if (g_meteo_hero) {
+          lv_obj_set_style_bg_color(g_meteo_hero, lv_color_hex(0x294B63), 0);
+          lv_obj_set_style_bg_grad_color(g_meteo_hero, lv_color_hex(0x0A131C), 0);
+        }
+        if (g_meteo_panel) {
+          lv_obj_set_style_border_color(g_meteo_panel, lv_color_hex(0x6FD9FF), 0);
+        }
         break;
     }
   }
 
-  if (g_lbl_meteo_cards) {
-    lv_label_set_text(
-        g_lbl_meteo_cards,
-        "TEMP  --.- C\nUMIDADE  --.- %\nPRESSAO / ALT  ---- hPa / ---- m\nUV / LUX  -- / ---\nAR / BATERIA  IAQ pendente / -- %");
+  {
+    const Bme688State bme = copyBme688State();
+    if (g_lbl_meteo_altitude) {
+      if (bme.has_data) {
+        lv_label_set_text_fmt(g_lbl_meteo_altitude, "%.1f m", bme.altitude_m);
+      } else {
+        lv_label_set_text(g_lbl_meteo_altitude, "--- m");
+      }
+    }
+    if (g_lbl_meteo_pressure) {
+      if (bme.has_data) {
+        lv_label_set_text_fmt(g_lbl_meteo_pressure, "%.1f hPa", bme.pressure_hpa);
+      } else {
+        lv_label_set_text(g_lbl_meteo_pressure, "---- hPa");
+      }
+    }
+    if (g_lbl_meteo_temperature) {
+      if (bme.has_data) {
+        lv_label_set_text_fmt(g_lbl_meteo_temperature, "%.1f C", bme.temperature_c);
+      } else {
+        lv_label_set_text(g_lbl_meteo_temperature, "--.- C");
+      }
+    }
+    if (g_lbl_meteo_humidity) {
+      if (bme.has_data) {
+        lv_label_set_text_fmt(g_lbl_meteo_humidity, "%.1f %%", bme.humidity_pct);
+      } else {
+        lv_label_set_text(g_lbl_meteo_humidity, "--.- %");
+      }
+    }
   }
 
   if (g_lbl_comms_wifi) {
-    char wifi_text[192];
+    char wifi_text[220];
     if (isLandscapeUI()) {
       snprintf(
           wifi_text,
           sizeof(wifi_text),
-          "AP: %s\nSSID: %s\nSenha: %s\nURL: http://%s\nCli: %u | Hits: %lu",
+          "AP: %s\nURL AP: http://%s\nLAN: %s\nIP LAN: %s\nCli AP: %u | Hits: %lu",
           wifiStateLabel(),
-          WIFI_AP_SSID,
-          WIFI_AP_PASSWORD,
-          ip_text,
+          ap_ip_text,
+          g_wifi_sta_connected ? "OK" : (g_wifi_sta_requested ? "..." : "--"),
+          g_wifi_sta_connected ? sta_ip_text : "--",
           static_cast<unsigned>(wifiClientCount()),
           static_cast<unsigned long>(g_wifi_web_hits));
     } else {
       snprintf(
           wifi_text,
           sizeof(wifi_text),
-          "AP: %s\nSSID: %s\nSenha: %s\nIP: %s",
+          "AP: %s\nIP: %s\nLAN: %s\nIP LAN: %s",
           wifiStateLabel(),
-          WIFI_AP_SSID,
-          WIFI_AP_PASSWORD,
-          ip_text,
-          static_cast<unsigned>(wifiClientCount()));
+          ap_ip_text,
+          g_wifi_sta_connected ? "OK" : (g_wifi_sta_requested ? "..." : "--"),
+          g_wifi_sta_connected ? sta_ip_text : "--");
     }
     lv_label_set_text(g_lbl_comms_wifi, wifi_text);
   }
@@ -3986,16 +5909,14 @@ static void refreshConfigUI()
     lv_label_set_text(
         g_lbl_comms_wifi_btn,
         isLandscapeUI()
-            ? (g_wifi_mode_requested ? "Desligar Wi-Fi AP" : "Ligar Wi-Fi AP")
+            ? (g_wifi_ap_requested ? "Desligar Wi-Fi AP" : "Ligar Wi-Fi AP")
             : "Wi-Fi");
   }
 
   if (g_lbl_comms_lora_btn) {
     lv_label_set_text(
         g_lbl_comms_lora_btn,
-        isLandscapeUI()
-            ? (g_lora_enabled ? "Desligar LoRa" : "Ligar LoRa")
-            : "LoRa");
+        isLandscapeUI() ? "Abrir menu LoRa" : "Menu LoRa");
   }
 
   if (g_lbl_comms_rescan_btn) {
@@ -4007,14 +5928,24 @@ static void refreshConfigUI()
   }
 
   if (g_lbl_comms_lora) {
+    const LoraState lora = copyLoraState();
     lv_label_set_text_fmt(
         g_lbl_comms_lora,
-        "Estado: %s\nTX: -- | RX: --\nRSSI: -- | SNR: --",
-        g_lora_enabled ? "ON" : "OFF");
+        "UART 17/18 | M0/1 7/8\nEstado: %s | AUX %s\nRX %lu | TX %lu",
+        g_lora_enabled ? "ON" : "OFF",
+        lora.aux_high ? "HIGH" : "LOW",
+        static_cast<unsigned long>(lora.rx_bytes),
+        static_cast<unsigned long>(lora.tx_bytes));
   }
 
   if (g_lbl_comms_gps) {
-    lv_label_set_text(g_lbl_comms_gps, "Fix: --\nSats: --\nSpeed: --\nAlt: --");
+    const GpsState gps = copyGpsState();
+    lv_label_set_text_fmt(
+        g_lbl_comms_gps,
+        "UART 43/44\nGPS: %s\nFix: %s | Sats: %u",
+        gps.receiving ? "NMEA RX" : "aguardando",
+        gps.has_fix ? "OK" : "--",
+        static_cast<unsigned>(gps.sats));
   }
 
   if (g_lbl_comms_status) {
@@ -4022,9 +5953,41 @@ static void refreshConfigUI()
         g_lbl_comms_status,
         isLandscapeUI()
             ? (g_wifi_ap_started
-                   ? "AP ativo. Veja SSID, senha e IP abaixo, abra 192.168.4.1 e acompanhe o serial."
+                   ? "AP ativo. Veja SSID, senha e IP abaixo, abra 192.168.4.1 e use COMMS como hub."
                    : "Ligue o AP aqui. O sistema entra em modo leve enquanto o Wi-Fi estiver ativo.")
-            : (g_wifi_ap_started ? "AP ativo. Abra 192.168.4.1" : "Ligue o AP para entrar no modo leve."));
+            : (g_wifi_ap_started ? "AP ativo. Abra 192.168.4.1" : "COMMS = hub de Wi-Fi, LoRa e GPS."));
+  }
+
+  if (g_lbl_lora_status) {
+    const LoraState lora = copyLoraState();
+    lv_label_set_text_fmt(
+        g_lbl_lora_status,
+        "LoRa UART %s\nPinos: TX17 RX18 M0=7 M1=8 AUX=6\nAUX %s | RX %lu",
+        g_lora_enabled ? "ON" : "OFF",
+        lora.aux_high ? "HIGH" : "LOW",
+        static_cast<unsigned long>(lora.rx_bytes));
+  }
+
+  if (g_lbl_lora_radio) {
+    const LoraState lora = copyLoraState();
+    lv_label_set_text_fmt(
+        g_lbl_lora_radio,
+        "Radio: E220 UART\nTX=17 RX=18 | M0=7 M1=8\nAUX=6 | %s | TX %lu",
+        g_lora_enabled ? "ligado" : "desligado",
+        static_cast<unsigned long>(lora.tx_bytes));
+  }
+
+  if (g_lbl_lora_test) {
+    const LoraState lora = copyLoraState();
+    lv_label_set_text(
+        g_lbl_lora_test,
+        g_lora_enabled
+            ? lora.note
+            : "LoRa UART desligado.\nLigue aqui para iniciar os testes do modulo serial.");
+  }
+
+  if (g_lbl_lora_toggle_btn) {
+    lv_label_set_text(g_lbl_lora_toggle_btn, g_lora_enabled ? "Desligar LoRa" : "Ligar LoRa");
   }
 }
 
@@ -4169,6 +6132,44 @@ void setup()
 
   Wire.begin(I2C_SDA, I2C_SCL, 400000UL);
   delay(50);
+  initBme688Sensor();
+  Serial1.begin(GPS_UART_BAUD, SERIAL_8N1, GPS_UART_RX_PIN, GPS_UART_TX_PIN);
+  g_gps_uart_ready = true;
+  GpsState gps_state = {};
+  gps_state.uart_ready = true;
+  snprintf(
+      gps_state.note,
+      sizeof(gps_state.note),
+      "UART GPS pronta | RX=%d TX=%d | aguardando NMEA",
+      GPS_UART_RX_PIN,
+      GPS_UART_TX_PIN);
+  storeGpsState(gps_state);
+  Serial.printf(
+      "[GPS] UART pronta | RX=%d TX=%d | baud=%lu\n",
+      GPS_UART_RX_PIN,
+      GPS_UART_TX_PIN,
+      static_cast<unsigned long>(GPS_UART_BAUD));
+  pinMode(LORA_M0_PIN, OUTPUT);
+  pinMode(LORA_M1_PIN, OUTPUT);
+  pinMode(LORA_AUX_PIN, INPUT_PULLUP);
+  digitalWrite(LORA_M0_PIN, LOW);
+  digitalWrite(LORA_M1_PIN, LOW);
+  Serial2.begin(LORA_UART_BAUD, SERIAL_8N1, LORA_UART_RX_PIN, LORA_UART_TX_PIN);
+  g_lora_uart_ready = true;
+  clearLoraHistory();
+  LoraState lora_state = {};
+  lora_state.uart_ready = true;
+  lora_state.enabled = g_lora_enabled;
+  lora_state.aux_high = digitalRead(LORA_AUX_PIN) == HIGH;
+  snprintf(
+      lora_state.note,
+      sizeof(lora_state.note),
+      "UART LoRa pronta | RX=%d TX=%d | AUX=%d",
+      LORA_UART_RX_PIN,
+      LORA_UART_TX_PIN,
+      LORA_AUX_PIN);
+  storeLoraState(lora_state);
+  Serial.printf("[LORA] UART pronta | TX=%d RX=%d M0=%d M1=%d AUX=%d | baud=%lu\n", LORA_UART_TX_PIN, LORA_UART_RX_PIN, LORA_M0_PIN, LORA_M1_PIN, LORA_AUX_PIN, static_cast<unsigned long>(LORA_UART_BAUD));
 
   initDisplay();
   initTouch();
@@ -4177,15 +6178,23 @@ void setup()
   startImuTask();
   startBlackboxTask();
   g_wifi_stack_ready = false;
-  g_wifi_mode_requested = false;
+  g_wifi_mode_requested = true;
+  g_wifi_ap_requested = true;
+  g_wifi_sta_requested = false;
+  g_wifi_apply_pending = true;
   g_wifi_ap_started = false;
+  g_wifi_sta_started = false;
+  g_wifi_sta_connected = false;
   g_wifi_web_started = false;
+  g_wifi_ap_ip = IPAddress(0, 0, 0, 0);
+  g_wifi_sta_ip = IPAddress(0, 0, 0, 0);
   g_wifi_web_hits = 0;
   g_wifi_last_client_ms = 0;
   g_wifi_last_status_ms = 0;
+  g_wifi_recover_request_ms = millis();
   updateRuntimeServiceMode();
   rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
-  Serial.println("[WIFI] AP integrado pronto. Ligue em COMMS > Wi-Fi AP");
+  Serial.println("[WIFI] AP integrado configurado para subir automaticamente no boot");
   printWifiStatus("Boot");
 
   Serial.println("[BOOT] Sistema pronto");
@@ -4206,10 +6215,16 @@ void loop()
 
   handleBootButton();
   updateWifiLed();
+  pollBme688Sensor();
+  pollGpsUart();
+  pollLoraUart();
 
   if (now - last_uptime >= 1000U) {
     last_uptime = now;
     const ImuState imu = copyImuState();
+    const Bme688State bme = copyBme688State();
+    const GpsState gps = copyGpsState();
+    const LoraState lora = copyLoraState();
 
     if (g_lbl_uptime) {
       lv_label_set_text_fmt(g_lbl_uptime, "Uptime: %lus", now / 1000UL);
@@ -4225,6 +6240,64 @@ void loop()
         imu.connected ? (imu.healthy ? "OK" : "WARN") : "OFF",
         imu.pitch_deg,
         imu.roll_deg);
+
+    if (bme.connected) {
+      if (bme.has_data) {
+        Serial.printf(
+            "[SERIAL][BME688] addr=0x%02X | T=%.1fC | H=%.1f%% | P=%.1fhPa | Alt=%.1fm | Gas=%.0fohm | note=%s\n",
+            bme.i2c_addr,
+            bme.temperature_c,
+            bme.humidity_pct,
+            bme.pressure_hpa,
+            bme.altitude_m,
+            bme.gas_ohms,
+            bme.note[0] ? bme.note : "OK");
+      } else {
+        Serial.printf(
+            "[SERIAL][BME688] addr=0x%02X | sem leitura valida | note=%s\n",
+            bme.i2c_addr,
+            bme.note[0] ? bme.note : "--");
+      }
+    } else {
+      Serial.printf("[SERIAL][BME688] OFF | note=%s\n", bme.note[0] ? bme.note : "nao detectado");
+    }
+
+    if (gps.uart_ready) {
+      if (gps.receiving || gps.sentence_seen) {
+        Serial.printf(
+            "[SERIAL][GPS] RX=%lu | linhas=%lu | fix=%s | sats=%u | lat=%.6f | lon=%.6f | alt=%.1fm | spd=%.1fkmh\n",
+            static_cast<unsigned long>(gps.rx_bytes),
+            static_cast<unsigned long>(gps.line_count),
+            gps.has_fix ? "OK" : "--",
+            static_cast<unsigned>(gps.sats),
+            gps.latitude_deg,
+            gps.longitude_deg,
+            gps.altitude_m,
+            gps.speed_kmh);
+        Serial.printf(
+            "[SERIAL][GPS] ultima=%s | note=%s\n",
+            gps.last_sentence[0] ? gps.last_sentence : "--",
+            gps.note[0] ? gps.note : "--");
+      } else {
+        Serial.printf("[SERIAL][GPS] UART pronta | sem trafego NMEA ainda | note=%s\n", gps.note[0] ? gps.note : "--");
+      }
+    } else {
+      Serial.println("[SERIAL][GPS] UART OFF");
+    }
+
+    Serial.printf(
+        "[SERIAL][LORA] estado=%s | uart=%s | AUX=%s | RX=%lu | TX=%lu | last_rx=%lu | last_tx=%lu\n",
+        lora.enabled ? "ON" : "OFF",
+        lora.uart_ready ? "OK" : "OFF",
+        lora.aux_high ? "HIGH" : "LOW",
+        static_cast<unsigned long>(lora.rx_bytes),
+        static_cast<unsigned long>(lora.tx_bytes),
+        static_cast<unsigned long>(lora.last_rx_ms),
+        static_cast<unsigned long>(lora.last_tx_ms));
+    Serial.printf(
+        "[SERIAL][LORA] ultima=%s | note=%s\n",
+        lora.last_message[0] ? lora.last_message : "--",
+        lora.note[0] ? lora.note : "--");
   }
 
   if (now - last_touch_ui >= 40U) {
