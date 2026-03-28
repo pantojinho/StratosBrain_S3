@@ -36,6 +36,10 @@ Uso:
 
 - `ESP RX = GPIO1`
 - `ESP TX = GPIO2`
+- `USB/CDC` continua separado no `USB Serial/JTAG` da placa
+- ligacao fisica:
+  - `TXD do GP10 -> GPIO1`
+  - `RXD do GP10 -> GPIO2`
 
 ### UART do LoRa
 
@@ -44,6 +48,7 @@ Uso:
 - `AUX = GPIO6`
 - `M0 = GPIO7`
 - `M1 = GPIO8`
+- `USB/CDC` nao conflita com essa UART
 
 ### SPI do cartao SD
 

@@ -51,6 +51,24 @@ c:\Esp32\CLAUDE\StratosBrain_S3\
 
 ## ✅ O Que Foi Implementado Nesta Sessão
 
+### 0. Rodada atual — UI local e conectividade
+- `PLANE` simplificado para foco em cards de voo; horizonte ficou fora do fluxo principal enquanto a animação não estiver estável
+- `COMMS` virou painel de conexão mais direto, com:
+  - `Wi-Fi AP`
+  - `Scan Wi-Fi`
+  - `LAN salva`
+  - `Menu LoRa`
+- scan local de Wi-Fi agora grava um resumo das redes encontradas na própria tela do dispositivo
+- home local deixou de destacar `IMU` e agora prioriza `SD`, `BME`, `Wi-Fi` e `LoRa`
+- documentação de UART/USB alinhada:
+  - `GPS = GPIO1/GPIO2`
+  - `LoRa = GPIO17/18 + AUX6 + M0/1 7/8`
+  - `CDC USB/JTAG` continua separado dessas UARTs
+- web atualizada para operação:
+  - aba `SD` com status, arquivo ativo, últimas linhas e lista de arquivos
+  - download do log ativo em `/download/blackbox`
+  - aba `LoRa` com resumo RX/TX e export do console em `/download/lora`
+
 ### 1. Dashboard Web (AJAX)
 - Substituído texto estático por JSON via `/api/status` (polling a cada 1,8s)
 - Abas: **Dashboard**, **GPS**, **Cartão SD**, **Meteorologia**, **Rede**, **LoRa**, **Configuração**, **Aviação**, **Visão Geral**
