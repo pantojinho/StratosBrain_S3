@@ -34,6 +34,7 @@
 #include <freertos/semphr.h>
 #include <lvgl.h>
 #include <WiFi.h>
+#include <Preferences.h>
 
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
@@ -54,6 +55,8 @@ static void efisSetLevelEventCb(lv_event_t *e);
 static void applyEfisViewMode();
 static void efisToggleViewEventCb(lv_event_t *e);
 // NOTE: loadScreenById(AppScreenId) declared after AppScreenId enum below
+static void saveWifiPrefs();
+static void loadWifiPrefs();
 
 static constexpr int LCD_CS = 9;
 static constexpr int LCD_CLK = 10;
@@ -3093,6 +3096,9 @@ static void requestWifiMode(bool enable, const char *origin)
     g_sd_purge_armed = false;
   }
 
+  // Persiste a alteracao de modo
+  saveWifiPrefs();
+
   updateWifiRequestedFlag();
   g_wifi_apply_pending = true;
   Serial.printf("[WIFI] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
@@ -3102,11 +3108,53 @@ static void requestWifiMode(bool enable, const char *origin)
 static void requestWifiStaMode(bool enable, const char *origin)
 {
   g_wifi_sta_requested = enable;
+  
+  // Persiste a alteracao de modo
+  saveWifiPrefs();
+
   updateWifiRequestedFlag();
   g_wifi_apply_pending = true;
   appendActivityLine("WIFI", enable ? "STA ON" : "STA OFF");
   Serial.printf("[WIFI] STA via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
   updateRuntimeServiceMode();
+}
+static void saveWifiPrefs()
+{
+  Preferences prefs;
+  if (!prefs.begin("wifi_cfg", false)) {
+    Serial.println("[NVS] ERRO: nao foi possivel abrir wifi_cfg para escrita");
+    return;
+  }
+  prefs.putString("ssid",     g_wifi_sta_ssid);
+  prefs.putString("password", g_wifi_sta_password);
+  prefs.putBool  ("ap_on",    g_wifi_ap_requested);
+  prefs.putBool  ("sta_on",   g_wifi_sta_requested);
+  prefs.end();
+  Serial.printf("[NVS] Salvo: SSID=%s | AP=%d | STA=%d\n",
+                g_wifi_sta_ssid, g_wifi_ap_requested, g_wifi_sta_requested);
+}
+
+static void loadWifiPrefs()
+{
+  Preferences prefs;
+  if (!prefs.begin("wifi_cfg", true)) {
+    Serial.println("[NVS] Sem dados Wi-Fi salvos, usando padrao AP");
+    return;
+  }
+  String ssid = prefs.getString("ssid", "");
+  String pass = prefs.getString("password", "");
+  bool   ap   = prefs.getBool  ("ap_on",  true);   // padrão: AP ligado
+  bool   sta  = prefs.getBool  ("sta_on", false);  // padrão: STA desligado
+  prefs.end();
+
+  if (ssid.length() > 0) {
+    snprintf(g_wifi_sta_ssid,      sizeof(g_wifi_sta_ssid),     "%s", ssid.c_str());
+    snprintf(g_wifi_sta_password,  sizeof(g_wifi_sta_password), "%s", pass.c_str());
+  }
+  g_wifi_ap_requested  = ap;
+  g_wifi_sta_requested = sta && (ssid.length() > 0); // STA só se tiver SSID
+  Serial.printf("[NVS] Carregado: SSID=%s | AP=%d | STA=%d\n",
+                g_wifi_sta_ssid[0] ? g_wifi_sta_ssid : "-", ap, sta);
 }
 
 static void requestWifiStaCredentials(const char *ssid, const char *password, const char *origin)
@@ -3117,6 +3165,9 @@ static void requestWifiStaCredentials(const char *ssid, const char *password, co
   if (password) {
     snprintf(g_wifi_sta_password, sizeof(g_wifi_sta_password), "%s", password);
   }
+
+  // Persiste na flash NVS para sobreviver ao reboot
+  saveWifiPrefs();
 
   if (g_wifi_sta_ssid[0]) {
     snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "Credenciais LAN prontas para %s", g_wifi_sta_ssid);
@@ -7751,10 +7802,14 @@ void setup()
   startImuTask();
   startBlackboxTask();
   g_wifi_stack_ready = false;
-  g_wifi_mode_requested = true;
-  g_wifi_ap_requested = true;
-  g_wifi_sta_requested = false;
-  g_wifi_apply_pending = true;
+  loadWifiPrefs();  // Restaura AP/STA/SSID/senha da NVS
+  g_wifi_mode_requested = g_wifi_ap_requested || g_wifi_sta_requested;
+  
+  if (!g_wifi_ap_requested && !g_wifi_sta_requested) {
+    g_wifi_ap_requested = true;  // Fallback: se nada salvo, sobe AP
+    g_wifi_mode_requested = true;
+  }
+
   g_wifi_ap_started = false;
   g_wifi_sta_started = false;
   g_wifi_sta_connected = false;
@@ -7764,6 +7819,10 @@ void setup()
   g_wifi_web_hits = 0;
   g_wifi_last_client_ms = 0;
   g_wifi_last_status_ms = 0;
+
+  // Carregar credenciais Wi-Fi STA persistidas na NVS
+  // (Removendo chamada antiga pois loadWifiPrefs ja carregou)
+
   g_wifi_recover_request_ms = millis();
   updateRuntimeServiceMode();
   rgbLedWrite(RGB_LED_PIN, 0, 0, 0);
