@@ -3779,7 +3779,63 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#08131d;borde
   client.print(F(R"SBWEB(
 <script>
 const $=i=>document.getElementById(i), txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v, toText=v=>String(txt(v));
-const put=(i,v)=>{const e=$(i); if(!e)return; const next=toText(v); if(e.textContent!==next)e.textContent=next;};
+let __dbgPrevOvGps = null;
+let __dbgPrevGpsLastRxMs = null;
+const __dbgIngestUrl = 'http://127.0.0.1:7246/ingest/f4d2790c-f89f-424e-99d5-7e2d5529be3e';
+
+const put=(i,v)=>{
+  const e=$(i);
+  if(!e) return;
+  const next=toText(v);
+  if(e.textContent!==next) e.textContent=next;
+
+  if(i==='ovGps' && next!==__dbgPrevOvGps){
+    __dbgPrevOvGps = next;
+    const receiving = next==='NMEA RX';
+    const fix = next==='Fix OK';
+    const last_rx_ms = __dbgPrevGpsLastRxMs;
+    // #region agent log H1-gps-receiving-transition
+    fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H1-gps-receiving',location:'web:put:ovGps',message:'gps receiving transition',data:{ovGps:next,receiving:receiving,fix:fix,last_rx_ms:last_rx_ms},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+  }
+
+  if(i==='gpsLastRx'){
+    const s=String(next);
+    const m=s.match(/(-?[0-9]+).*ms/);
+    const ms=m?parseInt(m[1],10):null;
+    if(ms!==__dbgPrevGpsLastRxMs){
+      __dbgPrevGpsLastRxMs = ms;
+      // #region agent log H1-gps-last-rx-ms
+      fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H1-gps-last-rx-ms',location:'web:put:gpsLastRx',message:'gps last_rx_ms changed',data:{last_rx_ms:ms},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+    }
+  }
+};
+
+const __origFetch = window.fetch ? window.fetch.bind(window) : fetch;
+window.fetch = (url, opts) => {
+  if (typeof url === 'string' && url === '/api/status') {
+    const t0 = Date.now();
+    return __origFetch(url, opts)
+      .then(resp => {
+        const dt = Date.now() - t0;
+        if (!resp.ok || dt > 250) {
+          // #region agent log H3-http-status
+          fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H3-http-status',location:'web:fetch:/api/status',message:'status response timing',data:{ok:resp.ok,status:resp.status,duration_ms:dt},timestamp:Date.now()})}).catch(()=>{});
+          // #endregion
+        }
+        return resp;
+      })
+      .catch(err => {
+        const dt = Date.now() - t0;
+        // #region agent log H3-http-status-fail
+        fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H3-http-status-fail',location:'web:fetch:/api/status',message:'status fetch failed',data:{error:String(err),duration_ms:dt},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        throw err;
+      });
+  }
+  return __origFetch(url, opts);
+};
 const val=(i,v)=>{const e=$(i); const next=toText(v); if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
 const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
 function linkify(id,href,label){const e=$(id); if(!e)return; const ok=!!(href&&href!==''&&href!=='--'); e.href=ok?href:'#'; e.style.pointerEvents=ok?'auto':'none'; e.style.opacity=ok?'1':'.5'; if(label&&e.textContent!==label)e.textContent=label;}
@@ -4001,13 +4057,79 @@ a.btn{display:inline-flex;align-items:center;justify-content:center}
 </div></section>)STRATOSWEB"));
   client.print(F(R"WEBJS(<script>
 const $=i=>document.getElementById(i), txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v, toText=v=>String(txt(v));
-const put=(i,v)=>{const e=$(i); if(!e)return; const next=toText(v); if(e.textContent!==next)e.textContent=next;};
+let __dbgPrevOvGps = null;
+let __dbgPrevGpsLastRxMs = null;
+const __dbgIngestUrl = 'http://127.0.0.1:7246/ingest/f4d2790c-f89f-424e-99d5-7e2d5529be3e';
+
+const put=(i,v)=>{
+  const e=$(i);
+  if(!e) return;
+  const next=toText(v);
+  if(e.textContent!==next) e.textContent=next;
+
+  if(i==='ovGps' && next!==__dbgPrevOvGps){
+    __dbgPrevOvGps = next;
+    const receiving = next==='NMEA RX';
+    const fix = next==='Fix OK';
+    const last_rx_ms = __dbgPrevGpsLastRxMs;
+    // #region agent log H1-gps-receiving-transition
+    fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H1-gps-receiving',location:'web:put:ovGps',message:'gps receiving transition',data:{ovGps:next,receiving:receiving,fix:fix,last_rx_ms:last_rx_ms},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+  }
+
+  if(i==='gpsLastRx'){
+    const s=String(next);
+    const m=s.match(/(-?[0-9]+).*ms/);
+    const ms=m?parseInt(m[1],10):null;
+    if(ms!==__dbgPrevGpsLastRxMs){
+      __dbgPrevGpsLastRxMs = ms;
+      if(__dbgPrevOvGps==='Sem GPS'){
+        // #region agent log H1-gps-last-rx-ms
+        fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H1-gps-last-rx-ms',location:'web:put:gpsLastRx',message:'gps last_rx_ms changed while receiving is off',data:{last_rx_ms:ms},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+      }
+    }
+  }
+};
+
+const __origFetch = window.fetch ? window.fetch.bind(window) : fetch;
+window.fetch = (url, opts) => {
+  if (typeof url === 'string' && url === '/api/status') {
+    const t0 = Date.now();
+    return __origFetch(url, opts)
+      .then(resp => {
+        const dt = Date.now() - t0;
+        if (!resp.ok || dt > 250) {
+          // #region agent log H3-http-status
+          fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H3-http-status',location:'web:fetch:/api/status',message:'status response timing',data:{ok:resp.ok,status:resp.status,duration_ms:dt},timestamp:Date.now()})}).catch(()=>{});
+          // #endregion
+        }
+        return resp;
+      })
+      .catch(err => {
+        const dt = Date.now() - t0;
+        // #region agent log H3-http-status-fail
+        fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H3-http-status-fail',location:'web:fetch:/api/status',message:'status fetch failed',data:{error:String(err),duration_ms:dt},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        throw err;
+      });
+  }
+  return __origFetch(url, opts);
+};
 const val=(i,v)=>{const e=$(i); const next=toText(v); if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
 const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
 function linkify(id,href,label){const e=$(id); if(!e)return; const ok=!!(href&&href!==''&&href!=='--'); e.href=ok?href:'#'; e.style.pointerEvents=ok?'auto':'none'; e.style.opacity=ok?'1':'.5'; if(label&&e.textContent!==label)e.textContent=label;}
 function setTab(name,writeHash=true){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+name));document.querySelectorAll('.tab').forEach(b=>{const active=b.dataset.tab===name; b.classList.toggle('active',active); b.setAttribute('aria-selected',active?'true':'false');}); if(writeHash) location.hash='tab='+name;}
 function activeTabFromHash(){const raw=(location.hash||'').replace(/^#/,''); return raw.startsWith('tab=')?raw.slice(4):'lab';}
-function act(q){return fetch('/api/action?'+q).then(r=>r.json()).then(()=>fetchData()).catch(err=>console.log('Action error',err));}
+function act(q){
+  const isRescan = typeof q === 'string' && q.indexOf('rescan=1') !== -1;
+  if (isRescan) {
+    // #region agent log H2-rescan-start
+    fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H2-heap-frag-after-rescan',location:'web:act',message:'rescan requested',data:{q:q},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+  }
+  return fetch('/api/action?'+q).then(r=>r.json()).then(()=>fetchData()).catch(err=>{console.log('Action error',err);});
+}
 function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){put('cmScanNote','Informe um SSID para conectar.'); return;} put('cmLanNote','Pedido de conexao enviado. Aguarde DHCP e veja o novo IP.'); act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on');}
 function sendLoraPayload(){const p=$('lrPayload').value.trim(); if(!p){put('lrNote','Informe um payload manual antes de enviar.'); return;} act('lora_payload='+encodeURIComponent(p));}
 ['cmStaSsid','cmStaPass'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>e.dataset.user='1');});
