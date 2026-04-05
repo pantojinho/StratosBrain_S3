@@ -180,6 +180,8 @@ static constexpr uint8_t GPS_ACTIVITY_LINE_COUNT = 10;
 static constexpr size_t GPS_ACTIVITY_LINE_LEN = 140;
 static constexpr uint8_t LORA_HISTORY_LINE_COUNT = 16;
 static constexpr size_t LORA_HISTORY_LINE_LEN = 140;
+static constexpr uint8_t LORA_CAPTURE_QUEUE_COUNT = 24;
+static constexpr size_t LORA_CAPTURE_LINE_LEN = 240;
 static constexpr uint32_t BOOT_BUTTON_GUARD_MS = 2500U;
 static constexpr uint32_t BOOT_BUTTON_DEBOUNCE_MS = 40U;
 static constexpr uint32_t BOOT_BUTTON_SHORT_PRESS_MS = 700U;
@@ -351,7 +353,7 @@ static bool g_wifi_mode_requested = false;
 static bool g_wifi_ap_requested = false;
 static bool g_wifi_sta_requested = false;
 static bool g_wifi_apply_pending = false;
-static bool g_lora_enabled = false;
+static bool g_lora_enabled = true;
 static bool g_lora_uart_ready = false;
 static bool g_gps_uart_ready = false;
 static bool g_lora_auto_tx_enabled = false;
@@ -382,6 +384,9 @@ static uint8_t g_gps_activity_head = 0;
 static char g_lora_history_lines[LORA_HISTORY_LINE_COUNT][LORA_HISTORY_LINE_LEN] = {};
 static uint8_t g_lora_history_count = 0;
 static uint8_t g_lora_history_head = 0;
+static char g_lora_capture_queue[LORA_CAPTURE_QUEUE_COUNT][LORA_CAPTURE_LINE_LEN] = {};
+static uint8_t g_lora_capture_queue_count = 0;
+static uint8_t g_lora_capture_queue_head = 0;
 static float g_efis_display_pitch_deg = 0.0f;
 static float g_efis_display_roll_deg = 0.0f;
 static bool g_efis_display_seeded = false;
@@ -578,6 +583,8 @@ static void storeGpsState(const GpsState &state);
 static GpsState copyGpsState();
 static void storeLoraState(const LoraState &state);
 static LoraState copyLoraState();
+static void enqueueLoraCaptureLog(const char *line);
+static uint8_t drainLoraCaptureLogsToSd();
 static uint8_t classifyMeteoTheme(const Bme688State &bme, char *theme_out, size_t theme_len, char *summary_out, size_t summary_len);
 static const char *orientationModeLabel(OrientationMode mode);
 static const char *screenIdSlug(AppScreenId screen_id);
@@ -1136,6 +1143,323 @@ static void formatLoraExportText(char *buffer, size_t buffer_len)
   buffer[out] = '\0';
 }
 
+static bool isAsciiDelimiter(char c)
+{
+  return c == '\0' || c == ' ' || c == '\t' || c == ',' || c == ';' || c == '|' || c == '\r' || c == '\n';
+}
+
+static bool matchKeyCaseInsensitive(const char *text, const char *key)
+{
+  if (!text || !key) {
+    return false;
+  }
+
+  for (size_t i = 0; key[i] != '\0'; ++i) {
+    if (text[i] == '\0') {
+      return false;
+    }
+    if (tolower(static_cast<unsigned char>(text[i])) != tolower(static_cast<unsigned char>(key[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static const char *findKeyValueStartCaseInsensitive(const char *text, const char *key)
+{
+  if (!text || !key || !key[0]) {
+    return nullptr;
+  }
+
+  const size_t key_len = strlen(key);
+  for (const char *p = text; *p != '\0'; ++p) {
+    if (p != text && !isAsciiDelimiter(*(p - 1))) {
+      continue;
+    }
+    if (!matchKeyCaseInsensitive(p, key)) {
+      continue;
+    }
+
+    const char next = p[key_len];
+    if (next == '\0') {
+      continue;
+    }
+
+    const char *value = p + key_len;
+    while (*value == ' ' || *value == '\t') {
+      ++value;
+    }
+    if (*value != ':' && *value != '=') {
+      continue;
+    }
+    ++value;
+    while (*value == ' ' || *value == '\t') {
+      ++value;
+    }
+    return value;
+  }
+
+  return nullptr;
+}
+
+static bool extractFloatFieldCaseInsensitive(const char *text, const char *key, float *value_out)
+{
+  if (!text || !key || !value_out) {
+    return false;
+  }
+
+  const char *value = findKeyValueStartCaseInsensitive(text, key);
+  if (!value) {
+    return false;
+  }
+
+  char *end_ptr = nullptr;
+  const float parsed = strtof(value, &end_ptr);
+  if (end_ptr == value) {
+    return false;
+  }
+
+  *value_out = parsed;
+  return true;
+}
+
+static bool extractTokenFieldCaseInsensitive(const char *text, const char *key, char *buffer, size_t buffer_len)
+{
+  if (!text || !key || !buffer || buffer_len == 0) {
+    return false;
+  }
+
+  const char *value = findKeyValueStartCaseInsensitive(text, key);
+  if (!value) {
+    return false;
+  }
+
+  size_t out = 0;
+  while (value[out] != '\0' && !isAsciiDelimiter(value[out]) && out < (buffer_len - 1U)) {
+    buffer[out] = value[out];
+    ++out;
+  }
+  buffer[out] = '\0';
+  return out > 0;
+}
+
+static bool extractCoordinatePair(const char *text, float *lat_out, float *lon_out)
+{
+  if (!text || !lat_out || !lon_out) {
+    return false;
+  }
+
+  for (const char *p = text; *p != '\0'; ++p) {
+    if (!(isdigit(static_cast<unsigned char>(*p)) || *p == '-' || *p == '+')) {
+      continue;
+    }
+
+    char *end_lat = nullptr;
+    const float lat = strtof(p, &end_lat);
+    if (!end_lat || end_lat == p) {
+      continue;
+    }
+
+    const char *next = end_lat;
+    while (*next == ' ' || *next == '\t' || *next == ',') {
+      ++next;
+    }
+
+    char *end_lon = nullptr;
+    const float lon = strtof(next, &end_lon);
+    if (!end_lon || end_lon == next) {
+      continue;
+    }
+
+    if (fabsf(lat) <= 90.0f && fabsf(lon) <= 180.0f) {
+      *lat_out = lat;
+      *lon_out = lon;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void sanitizeCsvField(const char *src, char *dst, size_t dst_len)
+{
+  if (!dst || dst_len == 0) {
+    return;
+  }
+
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+
+  size_t out = 0;
+  for (size_t i = 0; src[i] != '\0' && out < (dst_len - 1U); ++i) {
+    char c = src[i];
+    if (c == '"' || c == '\r' || c == '\n') {
+      c = '\'';
+    }
+    dst[out++] = c;
+  }
+  dst[out] = '\0';
+}
+
+static bool buildLoraCaptureCsvLine(const char *message, char *line_out, size_t line_len)
+{
+  if (!message || !message[0] || !line_out || line_len == 0) {
+    return false;
+  }
+
+  const GpsState gps = copyGpsState();
+  float lat = 0.0f;
+  float lon = 0.0f;
+  float alt = 0.0f;
+  float speed = 0.0f;
+  float course = 0.0f;
+  bool has_lat = extractFloatFieldCaseInsensitive(message, "lat", &lat) || extractFloatFieldCaseInsensitive(message, "latitude", &lat);
+  bool has_lon = extractFloatFieldCaseInsensitive(message, "lon", &lon) || extractFloatFieldCaseInsensitive(message, "lng", &lon) || extractFloatFieldCaseInsensitive(message, "long", &lon) || extractFloatFieldCaseInsensitive(message, "longitude", &lon);
+  const bool has_alt = extractFloatFieldCaseInsensitive(message, "alt", &alt) || extractFloatFieldCaseInsensitive(message, "altitude", &alt);
+  const bool has_speed = extractFloatFieldCaseInsensitive(message, "spd", &speed) || extractFloatFieldCaseInsensitive(message, "speed", &speed) || extractFloatFieldCaseInsensitive(message, "vel", &speed);
+  const bool has_course = extractFloatFieldCaseInsensitive(message, "course", &course) || extractFloatFieldCaseInsensitive(message, "cog", &course) || extractFloatFieldCaseInsensitive(message, "heading", &course) || extractFloatFieldCaseInsensitive(message, "crs", &course);
+
+  if ((!has_lat || !has_lon) && !extractCoordinatePair(message, &lat, &lon)) {
+    lat = 0.0f;
+    lon = 0.0f;
+    has_lat = false;
+    has_lon = false;
+  } else {
+    has_lat = true;
+    has_lon = true;
+  }
+
+  char node[32] = "-";
+  const char *node_keys[] = {"node", "id", "dev", "device", "call", "callsign", "name", "src", "from"};
+  bool node_found = false;
+  for (size_t i = 0; i < (sizeof(node_keys) / sizeof(node_keys[0])); ++i) {
+    if (extractTokenFieldCaseInsensitive(message, node_keys[i], node, sizeof(node))) {
+      node_found = true;
+      break;
+    }
+  }
+  if (!node_found) {
+    sanitizeCsvField("-", node, sizeof(node));
+  }
+
+  char raw[160];
+  sanitizeCsvField(message, raw, sizeof(raw));
+
+  char lat_text[24] = "";
+  char lon_text[24] = "";
+  char alt_text[24] = "";
+  char speed_text[24] = "";
+  char course_text[24] = "";
+  if (has_lat) {
+    snprintf(lat_text, sizeof(lat_text), "%.6f", static_cast<double>(lat));
+  }
+  if (has_lon) {
+    snprintf(lon_text, sizeof(lon_text), "%.6f", static_cast<double>(lon));
+  }
+  if (has_alt) {
+    snprintf(alt_text, sizeof(alt_text), "%.1f", static_cast<double>(alt));
+  }
+  if (has_speed) {
+    snprintf(speed_text, sizeof(speed_text), "%.1f", static_cast<double>(speed));
+  }
+  if (has_course) {
+    snprintf(course_text, sizeof(course_text), "%.1f", static_cast<double>(course));
+  }
+
+  const int written = snprintf(
+      line_out,
+      line_len,
+      "%s,%s,%lu,\"%s\",%s,%s,%s,%s,%s,\"%s\"\n",
+      gps.utc_date[0] ? gps.utc_date : "--",
+      gps.utc_time[0] ? gps.utc_time : "--:--:--",
+      static_cast<unsigned long>(millis() / 1000UL),
+      node,
+      lat_text,
+      lon_text,
+      alt_text,
+      speed_text,
+      course_text,
+      raw);
+  return written > 0 && static_cast<size_t>(written) < line_len;
+}
+
+static void enqueueLoraCaptureLog(const char *line)
+{
+  if (!line || !line[0]) {
+    return;
+  }
+
+  portENTER_CRITICAL(&g_lora_mux);
+  snprintf(g_lora_capture_queue[g_lora_capture_queue_head], LORA_CAPTURE_LINE_LEN, "%s", line);
+  g_lora_capture_queue_head = static_cast<uint8_t>((g_lora_capture_queue_head + 1U) % LORA_CAPTURE_QUEUE_COUNT);
+  if (g_lora_capture_queue_count < LORA_CAPTURE_QUEUE_COUNT) {
+    g_lora_capture_queue_count += 1U;
+  }
+  portEXIT_CRITICAL(&g_lora_mux);
+}
+
+static uint8_t drainLoraCaptureLogsToSd()
+{
+  const BlackboxState blackbox = copyBlackboxState();
+  if (!blackbox.mounted) {
+    return 0U;
+  }
+
+  if (!SD.exists("/logs") && !SD.mkdir("/logs")) {
+    return 0U;
+  }
+
+  char lines[LORA_CAPTURE_QUEUE_COUNT][LORA_CAPTURE_LINE_LEN];
+  uint8_t count = 0;
+
+  portENTER_CRITICAL(&g_lora_mux);
+  const uint8_t queued = g_lora_capture_queue_count;
+  const uint8_t head = g_lora_capture_queue_head;
+  for (uint8_t i = 0; i < queued && i < LORA_CAPTURE_QUEUE_COUNT; ++i) {
+    const uint8_t index = static_cast<uint8_t>((head + LORA_CAPTURE_QUEUE_COUNT - queued + i) % LORA_CAPTURE_QUEUE_COUNT);
+    snprintf(lines[count], LORA_CAPTURE_LINE_LEN, "%s", g_lora_capture_queue[index]);
+    ++count;
+  }
+  portEXIT_CRITICAL(&g_lora_mux);
+
+  if (count == 0U) {
+    return 0U;
+  }
+
+  File capture_file = SD.open("/logs/lora433_capture.csv", FILE_WRITE);
+  if (!capture_file) {
+    return 0U;
+  }
+
+  if (capture_file.size() == 0U) {
+    capture_file.println("capture_date_utc,capture_time_utc,uptime_s,node,lat,lon,alt_m,speed_kmh,course_deg,raw");
+  }
+
+  uint8_t written_count = 0;
+  for (uint8_t i = 0; i < count; ++i) {
+    const size_t line_size = strlen(lines[i]);
+    if (capture_file.write(reinterpret_cast<const uint8_t *>(lines[i]), line_size) == line_size) {
+      written_count += 1U;
+    } else {
+      break;
+    }
+  }
+  capture_file.flush();
+  capture_file.close();
+
+  if (written_count == count) {
+    portENTER_CRITICAL(&g_lora_mux);
+    if (g_lora_capture_queue_count == queued && g_lora_capture_queue_head == head) {
+      g_lora_capture_queue_count = 0U;
+    }
+    portEXIT_CRITICAL(&g_lora_mux);
+  }
+
+  return written_count;
+}
+
 static bool ipAddressValid(const IPAddress &ip)
 {
   return ip != IPAddress(0, 0, 0, 0);
@@ -1631,6 +1955,10 @@ static void finalizeLoraMessage(char *message)
   storeLoraState(state);
   appendLoraHistoryLine("RX", message);
   appendActivityLine("LORA", "payload RX");
+  char capture_line[LORA_CAPTURE_LINE_LEN];
+  if (buildLoraCaptureCsvLine(message, capture_line, sizeof(capture_line))) {
+    enqueueLoraCaptureLog(capture_line);
+  }
   Serial.printf("[LORA] RX: %s\n", message);
 }
 
@@ -1703,7 +2031,7 @@ static void pollLoraUart()
     snprintf(
         state.note,
         sizeof(state.note),
-        "LoRa pronto | AUX %s | sem trafego",
+        "LoRa monitorando | AUX %s | aguardando satelites",
         state.aux_high ? "HIGH" : "LOW");
   }
   storeLoraState(state);
@@ -2334,13 +2662,23 @@ static void onWifiIpEvent(void *, esp_event_base_t event_base, int32_t event_id,
   g_wifi_sta_started = true;
   char ip_text[20];
   formatIpAddress(g_wifi_sta_ip, ip_text, sizeof(ip_text));
-  snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN OK em http://%s", ip_text);
-  
   if (g_wifi_ap_requested) {
-    g_wifi_ap_requested = false;
-    g_wifi_apply_pending = true;
-    updateWifiRequestedFlag();
+    snprintf(
+        g_wifi_sta_note,
+        sizeof(g_wifi_sta_note),
+        "LAN OK em http://%s | AP mantido em http://192.168.4.1",
+        ip_text);
+    snprintf(
+        g_wifi_diag_note,
+        sizeof(g_wifi_diag_note),
+        "AP em http://192.168.4.1 | LAN em http://%s",
+        ip_text);
+  } else {
+    snprintf(g_wifi_sta_note, sizeof(g_wifi_sta_note), "LAN OK em http://%s", ip_text);
+    snprintf(g_wifi_diag_note, sizeof(g_wifi_diag_note), "LAN ativa em http://%s", ip_text);
   }
+  appendActivityLine("WIFI", "STA_GOT_IP");
+  Serial.printf("[WIFI] STA com IP %s | AP_req=%s\n", ip_text, g_wifi_ap_requested ? "on" : "off");
 }
 
 static bool ensureWifiStack()
@@ -3211,10 +3549,6 @@ static void requestWifiNetworkScan(const char *origin)
 static void requestLoraMode(bool enable, const char *origin)
 {
   g_lora_enabled = enable;
-  if (g_lora_uart_ready) {
-    digitalWrite(LORA_M0_PIN, LOW);
-    digitalWrite(LORA_M1_PIN, LOW);
-  }
   LoraState state = copyLoraState();
   state.enabled = enable;
   state.uart_ready = g_lora_uart_ready;
@@ -3226,7 +3560,7 @@ static void requestLoraMode(bool enable, const char *origin)
   snprintf(
       state.note,
       sizeof(state.note),
-      enable ? "LoRa habilitado | aguardando trafego" : "LoRa desabilitado");
+      enable ? "LR01/LR02 433 em escuta transparente | aguardando trafego" : "LR01/LR02 433 em pausa");
   storeLoraState(state);
   appendActivityLine("LORA", enable ? "ON" : "OFF");
   Serial.printf("[LORA] Pedido via %s: %s\n", origin ? origin : "sistema", enable ? "ON" : "OFF");
@@ -3956,53 +4290,86 @@ static void sendHttpDashboardV2(NetworkClient &client)
 <meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>StratosBrain Hub</title>
 <style>
-:root{--bg:#071019;--panel:#0d1823;--panel-2:#0b1520;--line:#21445f;--text:#eef6ff;--muted:#9ab2c7;--accent:#6fd6ff;--ok:#41d39b;--warn:#ffb357;--danger:#ff7a59}
-*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:linear-gradient(180deg,#06111a,#09131d 38%,#05090e);color:var(--text);overscroll-behavior:none}
-.wrap{padding:16px;max-width:1220px;margin:0 auto}.hero{background:linear-gradient(180deg,#102235,#0b1622);border:1px solid #1d5b86;border-radius:20px;padding:18px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,.28)}
-.hero h1{margin:6px 0 8px;font-size:34px}.lead{color:var(--muted);font-size:15px;line-height:1.5}
-.hero-grid,.section-grid,.split,.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
-.mini,.card{background:var(--panel);border:1px solid #21364a;border-radius:16px;padding:14px;transition:opacity .2s}
-.mini b,.card h3{display:block;margin:0 0 8px;font-size:13px;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}
-.toolbar,.tabs,.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-.btn{appearance:none;border:1px solid #255f85;background:#112131;color:#eef6ff;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer;text-decoration:none}
-.btn.alt{border-color:#386749;background:#11261c}.btn.warn{border-color:#87592d;background:#2b1d12}.btn.danger{border-color:#823843;background:#2b1418}.btn.small{padding:8px 12px;font-size:13px}
-.tab{background:#0c1722;border:1px solid #20384d}.tab.active{background:#143048;border-color:#4abfff}.tab[aria-selected='true']{background:#143048;border-color:#4abfff}
-.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px}.muted{color:var(--muted);font-size:14px;line-height:1.5}.mono{font-family:Consolas,monospace}
-.pill{display:inline-flex;align-items:center;padding:5px 10px;border-radius:999px;border:1px solid #275779;background:#123046;font-size:12px;font-weight:700}.pill.ok{border-color:#2f7b5a;background:#10281d;color:#d8ffe9}.pill.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}
-.notice{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid #3a586f;background:#0d1b28;color:#cfe7f7;font-size:13px}.notice.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}
+:root{--bg:#050816;--panel:#0d1728;--panel-2:#101d31;--line:#22415e;--line-soft:rgba(116,172,225,.18);--text:#edf6ff;--muted:#92abc4;--accent:#69d8ff;--ok:#41d39b;--warn:#ffc16d;--danger:#ff7b6b;--violet:#b39bff}
+*{box-sizing:border-box}
+body{margin:0;font-family:'Bahnschrift','Segoe UI Variable','Segoe UI',sans-serif;background:radial-gradient(circle at top,#10233a 0,#091320 26%,#050816 64%),linear-gradient(180deg,#06101c,#050816);color:var(--text);overscroll-behavior:none}
+.wrap{padding:18px;max-width:1320px;margin:0 auto}
+.hero{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(300px,.9fr);gap:14px;margin-bottom:16px}
+.hero-main,.hero-side,.card,.mini{background:linear-gradient(180deg,rgba(16,29,49,.94),rgba(8,15,25,.98));border:1px solid var(--line-soft);border-radius:24px;box-shadow:0 20px 50px rgba(0,0,0,.3)}
+.hero-main{padding:22px;position:relative;overflow:hidden}
+.hero-main::after{content:'';position:absolute;right:-90px;bottom:-110px;width:260px;height:260px;border-radius:50%;background:radial-gradient(circle,rgba(105,216,255,.22),rgba(105,216,255,0))}
+.hero-side{padding:14px}
+.hero h1{margin:8px 0 10px;font-size:clamp(34px,5vw,58px);line-height:.96}
+.lead{color:var(--muted);font-size:15px;line-height:1.6}
+.hero-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.section-grid,.split,.grid,.scope-grid,.metric-strip,.grid-2{display:grid;gap:12px}
+.section-grid,.split,.grid{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.mini,.card{padding:16px;transition:transform .18s ease,border-color .18s ease}
+.mini:hover,.card:hover{transform:translateY(-1px);border-color:rgba(105,216,255,.34)}
+.mini b,.card h3{display:block;margin:0 0 8px;font-size:12px;color:var(--accent);letter-spacing:.12em;text-transform:uppercase}
+.toolbar,.tabs,.actions,.protocol-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.btn{appearance:none;border:1px solid #2d5378;background:linear-gradient(180deg,#13253a,#0d1828);color:#eef6ff;border-radius:14px;padding:10px 14px;font-weight:700;cursor:pointer;text-decoration:none;transition:transform .18s ease,border-color .18s ease}
+.btn:hover{transform:translateY(-1px);border-color:#73dfff}.btn.alt{border-color:#3c8a66;background:linear-gradient(180deg,#123125,#0d2017)}.btn.warn{border-color:#8a6134;background:linear-gradient(180deg,#322313,#24170d)}.btn.danger{border-color:#8a3945;background:linear-gradient(180deg,#34161a,#231014)}.btn.small{padding:8px 11px;font-size:13px}
+.tabs{position:sticky;top:0;z-index:5;padding:8px 0 14px;background:linear-gradient(180deg,rgba(5,8,22,.96),rgba(5,8,22,.78) 74%,rgba(5,8,22,0))}
+.tab{background:rgba(12,22,36,.82);border:1px solid rgba(84,129,178,.28);border-radius:999px}.tab.active,.tab[aria-selected='true']{background:linear-gradient(180deg,#173650,#112435);border-color:#67d8ff}
+.section{display:none}.section.active{display:block}.big{font-size:30px;font-weight:700;margin:4px 0 6px;line-height:1}.muted{color:var(--muted);font-size:14px;line-height:1.55}.mono{font-family:'Cascadia Code','Consolas',monospace}
+.pill{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;border:1px solid #2c5378;background:#123047;font-size:12px;font-weight:700}.pill.ok{border-color:#3c8a66;background:#10281d;color:#d8ffe9}.pill.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}.pill.violet{border-color:#6555a6;background:#18172c;color:#ddd5ff}
+.notice{margin-top:10px;padding:11px 13px;border-radius:14px;border:1px solid rgba(78,119,164,.34);background:rgba(11,23,38,.76);color:#d0e8f8;font-size:13px;line-height:1.55}.notice.warn{border-color:#8a6a34;background:#2d2110;color:#ffe7b5}
 .listbox{display:flex;flex-direction:column;gap:8px;margin-top:10px}
-.network-item{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;padding:10px 12px;border:1px solid #21364a;border-radius:12px;background:#0b1a28;color:#eef6ff;text-align:left;cursor:pointer}.network-item:hover{border-color:#4abfff}.network-meta{color:var(--muted);font-size:12px}
-.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;align-items:start}.kv b{color:#b8dfff;font-size:12px;letter-spacing:.05em;text-transform:uppercase}
+.network-item{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;padding:11px 12px;border:1px solid rgba(84,129,178,.24);border-radius:14px;background:#0b1a28;color:#eef6ff;text-align:left;cursor:pointer}.network-item:hover{border-color:#4abfff}.network-meta{color:var(--muted);font-size:12px}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;align-items:start}.kv b{color:#b8dfff;font-size:11px;letter-spacing:.12em;text-transform:uppercase}
 .full{grid-column:1/-1}
-label{display:block;margin-top:10px;color:#b8dfff;font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
-input{width:100%;background:#08131d;border:1px solid #21445f;border-radius:10px;color:#eef6ff;padding:10px;margin-top:6px}
-pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#08131d;border:1px solid #1d3245;border-radius:12px;padding:12px;min-height:110px;color:#d7edf7}
-#skyplot{background:#070f15;border-radius:50%;width:100%;max-width:300px;aspect-ratio:1;display:block;margin:10px auto;border:1px solid #21364a}
-#ahCanvas{display:block;margin:0 auto;border-radius:12px;background:#0a1520;border:1px solid #21364a}
+label{display:block;margin-top:10px;color:#b8dfff;font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+input{width:100%;background:#08131d;border:1px solid rgba(84,129,178,.26);border-radius:12px;color:#eef6ff;padding:11px;margin-top:6px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#08131d;border:1px solid rgba(84,129,178,.18);border-radius:16px;padding:12px;min-height:110px;color:#d7edf7}
+#skyplot{background:#070f15;border-radius:50%;width:100%;max-width:320px;aspect-ratio:1;display:block;margin:10px auto;border:1px solid rgba(84,129,178,.22)}
+#ahCanvas,#loraScope,#loraWaterfall{display:block;margin:0 auto;border-radius:16px;background:#0a1520;border:1px solid rgba(84,129,178,.22);width:100%}
+.hero-brow{display:inline-flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:#98e2ff}.hero-brow::before{content:'';width:28px;height:1px;background:linear-gradient(90deg,#98e2ff,transparent)}
+.hero-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}
+.hero-link{padding:13px 14px;border-radius:18px;background:rgba(8,15,26,.66);border:1px solid rgba(84,129,178,.18)}
+.hero-link strong{display:block;font-size:17px}.hero-link span{display:block;color:var(--muted);font-size:13px;margin-top:5px}
+.scope-grid{grid-template-columns:1.4fr .9fr}.metric-strip{grid-template-columns:repeat(4,minmax(0,1fr))}
+.metric-chip{padding:13px 14px;border-radius:18px;background:rgba(8,15,26,.72);border:1px solid rgba(84,129,178,.18)}
+.metric-chip span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}.metric-chip strong{display:block;font-size:18px;margin-top:7px}
+.protocol{appearance:none;border:1px solid rgba(84,129,178,.26);background:rgba(12,22,36,.74);color:var(--text);border-radius:999px;padding:10px 14px;font-weight:700;cursor:pointer}.protocol.active{border-color:#69d8ff;background:#153552}
+.preview{min-height:88px}.stack{display:grid;gap:12px}.grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.meter{height:10px;border-radius:999px;background:#08111e;border:1px solid rgba(84,129,178,.2);overflow:hidden}.meter-bar{display:block;height:100%;width:8%;background:linear-gradient(90deg,#4abfff,#8fffd0)}.meter-bar.tx{background:linear-gradient(90deg,#ffb870,#ff7b6b)}
 a.btn{display:inline-flex;align-items:center;justify-content:center}
+@media (max-width:980px){.hero{grid-template-columns:1fr}.hero-grid,.hero-links,.scope-grid,.grid-2,.metric-strip{grid-template-columns:1fr}.kv{grid-template-columns:1fr}}
 </style></head><body><div class='wrap'>
 <div class='hero'>
-  <h1>StratosBrain Hub</h1>
-  <div class='lead'>Painel web do ESP32 para telemetria, log local e enlaces LoRa/Wi-Fi.</div>
-  <div class='hero-grid'>
-    <div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div>
-    <div class='mini'><b>LAN Local</b><span id='heroLan'>--</span></div>
-    <div class='mini'><b>URL ativa</b><span class='mono' id='heroIp'>--</span></div>
-    <div class='mini'><b>Runtime</b><span id='heroMode'>--</span></div>
+  <div class='hero-main'>
+    <span class='hero-brow'>STRATOSBRAIN S3</span>
+    <h1>Command Surface</h1>
+    <div class='lead'>Painel web redesenhado para operar o equipamento com menos atrito. O foco agora e comando rapido, leitura mais limpa e um deck LoRa dedicado em linguagem visual inspirada em SDR.</div>
+    <div class='toolbar'>
+      <button class='btn alt' type='button' onclick="act('wifi=toggle')">Wi-Fi AP</button>
+      <button class='btn small' type='button' onclick="act('logger=toggle')">Logger SD</button>
+      <button class='btn warn' type='button' onclick="act('lora=toggle')">LoRa 433 UART</button>
+      <button class='btn small' type='button' onclick="setTab('tracker433')">Abrir tracker 433</button>
+    </div>
+    <div class='hero-links'>
+      <div class='hero-link'><strong id='heroLora'>--</strong><span id='heroLoraNote'>LoRa 433 monitor</span></div>
+      <div class='hero-link'><strong id='heroMode'>--</strong><span>Runtime do firmware</span></div>
+    </div>
   </div>
-  <div class='toolbar'>
-    <button class='btn alt' type='button' onclick="act('wifi=toggle')">Wi-Fi AP</button>
-    <button class='btn small' type='button' onclick="act('logger=toggle')">Logger SD</button>
-    <button class='btn warn' type='button' onclick="act('lora=toggle')">LoRa UART</button>
+  <div class='hero-side'>
+    <div class='hero-grid'>
+      <div class='mini'><b>Wi-Fi AP</b><span id='heroAp'>--</span></div>
+      <div class='mini'><b>LAN Local</b><span id='heroLan'>--</span></div>
+      <div class='mini'><b>URL ativa</b><span class='mono' id='heroIp'>--</span></div>
+      <div class='mini'><b>Nota LAN</b><span id='heroStaNote'>--</span></div>
+    </div>
   </div>
 </div>
 <div class='tabs' role='tablist' aria-label='Abas do painel web'>
-  <button class='btn tab active' type='button' role='tab' aria-selected='true' data-tab='lab' onclick="setTab('lab')">Dashboard</button>
+  <button class='btn tab active' type='button' role='tab' aria-selected='true' data-tab='lab' onclick="setTab('lab')">Operacao</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='gps' onclick="setTab('gps')">GPS</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='sd' onclick="setTab('sd')">Cartao SD</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='meteo' onclick="setTab('meteo')">Meteorologia</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='comms' onclick="setTab('comms')">Rede</button>
-  <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='lora' onclick="setTab('lora')">LoRa</button>
+  <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='tracker433' onclick="setTab('tracker433')">Tracker GPS LORA 433</button>
+  <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='lora' onclick="setTab('lora')">Console 433</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='config' onclick="setTab('config')">Configuracao</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='plane' onclick="setTab('plane')">Aviacao</button>
   <button class='btn tab' type='button' role='tab' aria-selected='false' data-tab='overview' onclick="setTab('overview')">Visao geral</button>
@@ -4010,7 +4377,43 @@ a.btn{display:inline-flex;align-items:center;justify-content:center}
 <section class='section active' id='section-lab'><div class='section-grid'>
   <div class='card'><h3>BME688</h3><div class='big' id='labBmeState'>--</div><div class='muted'>Pitch/Roll: <span id='labImuPitch'>--</span> / <span id='labImuRoll'>--</span><br>Logger SD: <span id='labSdLogger'>--</span></div></div>
   <div class='card'><h3>GPS NMEA</h3><div class='big' id='labGpsState'>--</div><div class='muted'>Fix: <span id='labGpsFix'>--</span><br>Satelites: <span id='labGpsSats'>--</span><br>Lat/Lon: <span class='mono' id='labGpsPos'>--</span><br>Ultima: <span class='mono' id='labGpsSentence'>--</span></div></div>
-  <div class='card'><h3>LoRa UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>RX: <span id='lrRx2'>--</span> | TX: <span id='lrTx2'>--</span><br>AUX: <span id='lrAux2'>--</span><br>Ultimo trafego: <span class='mono' id='lrMsg2'>--</span></div><div class='toolbar'><button class='btn small' type='button' onclick="act('lora_tx=summary')">Enviar resumo</button></div></div>
+  <div class='card'><h3>LoRa 433 UART</h3><div class='big' id='labLoraState'>--</div><div class='muted'>RX: <span id='lrRx2'>--</span> | TX: <span id='lrTx2'>--</span><br>AUX: <span id='lrAux2'>--</span><br>Ultimo trafego: <span class='mono' id='lrMsg2'>--</span></div><div class='toolbar'><button class='btn small' type='button' onclick="act('lora_tx=summary')">Enviar resumo</button></div></div>
+</div></section>
+<section class='section' id='section-tracker433'><div class='section-grid'>
+  <div class='card full'>
+    <h3>Tracker GPS LORA 433</h3>
+    <div class='lead'>Modo leve para monitorar balizas e objetos passando em 433 via UART. O parser trabalha em cima dos payloads recebidos e tenta extrair nodo, latitude, longitude, altitude e velocidade.</div>
+    <div class='metric-strip' style='margin-top:14px'>
+      <div class='metric-chip'><span>Status</span><strong id='tr433State'>--</strong></div>
+      <div class='metric-chip'><span>Nodo</span><strong id='tr433Node'>--</strong></div>
+      <div class='metric-chip'><span>Posicao</span><strong class='mono' id='tr433LatLon'>--</strong></div>
+      <div class='metric-chip'><span>Ultimo pacote</span><strong id='tr433Age'>--</strong></div>
+    </div>
+  </div>
+  <div class='card'>
+    <h3>Coordenadas extraidas</h3>
+    <div class='kv'>
+      <b>Latitude</b><span id='tr433Lat'>--</span>
+      <b>Longitude</b><span id='tr433Lon'>--</span>
+      <b>Altitude</b><span id='tr433Alt'>--</span>
+      <b>Velocidade</b><span id='tr433Speed'>--</span>
+      <b>Curso</b><span id='tr433Course'>--</span>
+      <b>Fonte</b><span id='tr433Source'>--</span>
+    </div>
+    <div class='toolbar'>
+      <a class='btn small' id='tr433Osm' href='#' target='_blank'>OpenStreetMap</a>
+      <a class='btn small' id='tr433Google' href='#' target='_blank'>Google Maps</a>
+      <button class='btn small' type='button' onclick="setTab('lora')">Abrir console 433</button>
+    </div>
+  </div>
+  <div class='card'>
+    <h3>Ultimo pacote bruto</h3>
+    <pre class='mono' id='tr433Raw'>--</pre>
+  </div>
+  <div class='card full'>
+    <h3>Historico detectado</h3>
+    <pre class='mono' id='tr433History'>--</pre>
+  </div>
 </div></section>
 <section class='section' id='section-plane'><div class='section-grid'>
   <div class='card'><h3>Cockpit virtual</h3><div class='muted'>Altitude e velocidade filtradas a partir do Bosch + GPS.</div></div>
@@ -4027,7 +4430,7 @@ a.btn{display:inline-flex;align-items:center;justify-content:center}
   <div class='card'><h3>Terminal serial GPS</h3><pre id='gpsSentence'>--</pre></div>
 </div></section>
 <section class='section' id='section-sd'><div class='section-grid'>
-  <div class='card'><h3>Status do SD</h3><div class='big' id='sdMounted'>--</div><div class='muted'>Logger: <span id='sdLogger'>--</span><br>Arquivo ativo: <span class='mono' id='sdFile'>--</span><br>Registros: <span id='sdRecords'>--</span><br>Capacidade: <span id='sdSize'>--</span></div><div class='toolbar'><button class='btn small' type='button' onclick="act('sd=remount')">Remount SD</button><a class='btn small' href='/download/blackbox' target='_blank'>Baixar log ativo</a></div></div>
+  <div class='card'><h3>Status do SD</h3><div class='big' id='sdMounted'>--</div><div class='muted'>Logger: <span id='sdLogger'>--</span><br>Arquivo ativo: <span class='mono' id='sdFile'>--</span><br>Registros: <span id='sdRecords'>--</span><br>Capacidade: <span id='sdSize'>--</span></div><div class='toolbar'><button class='btn small' type='button' onclick="act('sd=remount')">Remount SD</button><a class='btn small' href='/download/blackbox' target='_blank'>Baixar log ativo</a><a class='btn small' href='/download/lora433' target='_blank'>Baixar capturas 433</a></div></div>
   <div class='card'><h3>Arquivos do SD</h3><pre id='sdFiles'>--</pre></div>
   <div class='card full'><h3>Ultimas linhas</h3><pre id='sdTail'>--</pre></div>
 </div></section>
@@ -4039,11 +4442,83 @@ a.btn{display:inline-flex;align-items:center;justify-content:center}
   <div class='card'><h3>Umidade</h3><div class='big' id='mtHum'>--</div><div class='muted'>relativa</div></div>
 </div></section>
 <section class='section' id='section-lora'><div class='section-grid'>
-  <div class='card'><h3>Recepcao UART LoRa</h3><div class='big' id='lrState'>--</div><div class='kv'><b>UART</b><span id='lrUart'>--</span><b>AUX</b><span id='lrAux'>--</span><b>RX agora</b><span id='lrRxState'>--</span><b>Ultimo RX</b><span class='mono' id='lrLastRx'>--</span></div><div class='toolbar'><button class='btn warn' type='button' onclick="act('lora=toggle')">Ligar/Desligar LoRa</button><button class='btn small' type='button' onclick="act('lora_clear=1')">Limpar console</button></div></div>
-  <div class='card'><h3>Transmissao manual</h3><label for='lrPayload'>Payload manual</label><input id='lrPayload' name='lrPayload' type='text' placeholder='Ex: STATUS? ou ALVO=ALPHA,T=33'><div class='toolbar'><button class='btn small' type='button' onclick="sendLoraPayload()">Enviar texto</button><button class='btn small' type='button' onclick="act('lora_tx=status')">Enviar STATUS?</button><button class='btn small' type='button' onclick="act('lora_tx=summary')">Enviar resumo</button><button class='btn small' type='button' onclick="act('lora_tx=meteo')">Enviar METEO</button><button class='btn small' type='button' onclick="act('lora_tx=gps')">Enviar GPS</button><a class='btn small' href='/download/lora' target='_blank'>Exportar console</a></div></div>
-  <div class='card'><h3>Auto TX 30s</h3><div class='big' id='lrAutoState'>--</div><div class='kv'><b>Modo</b><span id='lrAutoMode'>--</span><b>Intervalo</b><span id='lrAutoInterval'>--</span><b>Ultimo envio</b><span id='lrAutoLast'>--</span></div><div class='toolbar'><button class='btn alt' type='button' onclick="act('lora_auto=toggle')">Ligar/Desligar Auto TX</button><button class='btn small' type='button' onclick="act('lora_auto_mode=summary')">Modo resumo</button><button class='btn small' type='button' onclick="act('lora_auto_mode=meteo')">Modo METEO</button><button class='btn small' type='button' onclick="act('lora_auto_mode=gps')">Modo GPS</button></div></div>
-  <div class='card'><h3>Resumo RX/TX</h3><div class='kv'><b>RX bytes</b><span id='lrRxBytes'>--</span><b>TX bytes</b><span id='lrTxBytes'>--</span><b>Ultimo TX</b><span class='mono' id='lrLastTx'>--</span><b>Nota</b><span id='lrNote'>--</span></div></div>
-  <div class='card full'><h3>Console RX/TX UART</h3><div class='notice'>Este painel mostra payloads recebidos e enviados pela UART do modulo LoRa. Nao e SDR nem analise bruta de RF.</div><pre id='lrConsole'>--</pre></div>
+  <div class='card full'>
+    <h3>Exclusive LoRa Deck</h3>
+    <div class='lead'>Tela dedicada de RX/TX inspirada em SDR para MeshCore, Meshtastic e LoRa IoT. O visual abaixo e sintetizado a partir do trafego UART do modulo LoRa, nao de RF bruto.</div>
+    <div class='metric-strip' style='margin-top:14px'>
+      <div class='metric-chip'><span>Status</span><strong id='lrState'>--</strong></div>
+      <div class='metric-chip'><span>UART / AUX</span><strong><span id='lrUart'>--</span> / <span id='lrAux'>--</span></strong></div>
+      <div class='metric-chip'><span>RX agora</span><strong id='lrRxState'>--</strong></div>
+      <div class='metric-chip'><span>Auto TX</span><strong id='lrAutoState'>--</strong></div>
+    </div>
+    <div class='scope-grid' style='margin-top:14px'>
+      <div class='stack'>
+        <div>
+          <canvas id='loraScope' width='760' height='220'></canvas>
+          <div class='grid-2' style='margin-top:10px'>
+            <div>
+              <div class='muted' style='margin-bottom:6px'>RX payload <span id='lrRxBytes'>--</span></div>
+              <div class='meter'><span class='meter-bar' id='lrRxMeter'></span></div>
+            </div>
+            <div>
+              <div class='muted' style='margin-bottom:6px'>TX payload <span id='lrTxBytes'>--</span></div>
+              <div class='meter'><span class='meter-bar tx' id='lrTxMeter'></span></div>
+            </div>
+          </div>
+        </div>
+        <div class='notice' id='lrDeckNote'>Console de payload UART LoRa. Nao e analisador SDR/RF.</div>
+      </div>
+      <div class='stack'>
+        <canvas id='loraWaterfall' width='420' height='220'></canvas>
+        <div class='kv'>
+          <b>Ultimo RX</b><span class='mono' id='lrLastRx'>--</span>
+          <b>Ultimo TX</b><span class='mono' id='lrLastTx'>--</span>
+          <b>Modo auto</b><span id='lrAutoMode'>--</span>
+          <b>Intervalo</b><span id='lrAutoInterval'>--</span>
+          <b>Ultimo envio</b><span id='lrAutoLast'>--</span>
+          <b>Nota</b><span id='lrNote'>--</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class='card'>
+    <h3>Transmissao tatica</h3>
+    <div class='protocol-row'>
+      <button class='protocol active' type='button' data-profile='meshcore' onclick="selectProtocol('meshcore')">MeshCore</button>
+      <button class='protocol' type='button' data-profile='meshtastic' onclick="selectProtocol('meshtastic')">Meshtastic</button>
+      <button class='protocol' type='button' data-profile='iot' onclick="selectProtocol('iot')">LoRa IoT</button>
+      <button class='protocol' type='button' data-profile='free' onclick="selectProtocol('free')">Livre</button>
+    </div>
+    <div class='notice' id='lrProfileHint'>Perfil MeshCore pronto para comando rapido.</div>
+    <div class='grid-2'>
+      <div><label for='lrTarget'>Destino / nodo</label><input id='lrTarget' name='lrTarget' type='text' placeholder='ex: alpha-1 ou ^all'></div>
+      <div><label for='lrCommand'>Comando</label><input id='lrCommand' name='lrCommand' type='text' placeholder='ex: beacon, text, uplink'></div>
+    </div>
+    <label for='lrPayload'>Payload</label><input id='lrPayload' name='lrPayload' type='text' placeholder='Digite a mensagem, comando ou dados'>
+    <label>Preview TX</label><pre class='preview mono' id='lrPreview'>--</pre>
+    <div class='toolbar'>
+      <button class='btn' type='button' onclick="sendLoraPayload()">Transmitir preview</button>
+      <button class='btn small' type='button' onclick="act('lora_tx=status')">Enviar STATUS?</button>
+      <button class='btn small' type='button' onclick="act('lora_tx=summary')">Enviar resumo</button>
+      <button class='btn small' type='button' onclick="act('lora_tx=meteo')">Enviar METEO</button>
+      <button class='btn small' type='button' onclick="act('lora_tx=gps')">Enviar GPS</button>
+      <a class='btn small' href='/download/lora' target='_blank'>Exportar console</a>
+      <a class='btn small' href='/download/lora433' target='_blank'>Baixar capturas 433</a>
+    </div>
+  </div>
+  <div class='card'>
+    <h3>Escuta e automacao</h3>
+    <div class='toolbar'>
+      <button class='btn warn' type='button' onclick="act('lora=toggle')">Ligar/Desligar LoRa</button>
+      <button class='btn small' type='button' onclick="act('lora_clear=1')">Limpar console</button>
+      <button class='btn alt' type='button' onclick="act('lora_auto=toggle')">Ligar/Desligar Auto TX</button>
+      <button class='btn small' type='button' onclick="act('lora_auto_mode=summary')">Modo resumo</button>
+      <button class='btn small' type='button' onclick="act('lora_auto_mode=meteo')">Modo METEO</button>
+      <button class='btn small' type='button' onclick="act('lora_auto_mode=gps')">Modo GPS</button>
+    </div>
+    <div class='notice'>Use esta area para alternar entre escuta, envio imediato e repeticao automatica sem sair do deck.</div>
+  </div>
+  <div class='card full'><h3>Console RX/TX UART</h3><div class='notice'>A waterfall acima e sintetica. O console abaixo mostra os payloads reais recebidos e enviados pela UART do modulo LoRa.</div><pre id='lrConsole'>--</pre></div>
 </div></section>
 <section class='section' id='section-comms'><div class='section-grid'>
   <div class='card'><h3>Modo de rede</h3><div class='big' id='cmMode'>--</div><div class='kv'><b>AP</b><span id='cmApState'>--</span><b>LAN</b><span id='cmLanState'>--</span><b>IP LAN</b><span class='mono' id='cmStaIp'>--</span><b>Clientes AP</b><span id='cmClients'>--</span><b>Hits web</b><span id='cmHits'>--</span></div><div class='toolbar'><button class='btn alt' type='button' onclick="act('wifi=toggle')">Ligar/Desligar AP</button><button class='btn small' id='btnScanWifi' type='button' onclick='scanWifi()'>Varrer redes</button><button class='btn small warn' type='button' onclick="act('sta=off')">Desconectar LAN</button></div></div>
@@ -4070,35 +4545,99 @@ const put=(i,v)=>{const e=$(i); if(!e) return; const next=toText(v); if(e.textCo
 const val=(i,v)=>{const e=$(i); const next=toText(v); if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
 const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
 const STATUS_INTERVAL_MS=2500, DETAIL_INTERVAL_MS=10000, REQUEST_TIMEOUT_MS=4500;
-let statusBusy=false, detailBusy=false, lastDetailAt=0;
+const uiState={statusBusy:false,detailBusy:false,lastDetailAt:0,activeProfile:'meshcore',waterfall:[],pauseUntil:0,apiOrigin:'',candidateOrigins:[location.origin]};
+const profileDefs={
+  meshcore:{hint:'Envelope rapido para beacons e comandos MeshCore.',target:'alpha-1',command:'beacon',payload:'hello mesh'},
+  meshtastic:{hint:'Preset simples para broadcast e texto estilo Meshtastic.',target:'^all',command:'text',payload:'ping team'},
+  iot:{hint:'Formato orientado a telemetria LoRa IoT.',target:'sensor-a',command:'uplink',payload:'temp=24.6,hum=51'},
+  free:{hint:'Modo livre. O payload sera transmitido exatamente como digitado.',target:'',command:'',payload:''}
+};
+function multi(v){return txt(v).replaceAll('\\n','\n');}
 function linkify(id,href,label){const e=$(id); if(!e)return; const ok=!!(href&&href!==''&&href!=='--'); e.href=ok?href:'#'; e.style.pointerEvents=ok?'auto':'none'; e.style.opacity=ok?'1':'.5'; if(label&&e.textContent!==label)e.textContent=label;}
+function rememberOrigin(origin){if(!origin||typeof origin!=='string') return; const clean=origin.replace(/\/$/,''); if(!/^https?:\/\//.test(clean)) return; if(!uiState.candidateOrigins.includes(clean)) uiState.candidateOrigins.unshift(clean);}
+function rememberOriginsFromData(d){rememberOrigin(location.origin); if(d&&d.wifi){if(d.wifi.ap_ip&&d.wifi.ap_ip!=='--') rememberOrigin('http://'+d.wifi.ap_ip); if(d.wifi.sta_ip&&d.wifi.sta_ip!=='--') rememberOrigin('http://'+d.wifi.sta_ip); if(d.wifi.ip&&d.wifi.ip!=='--') rememberOrigin('http://'+d.wifi.ip);}}
 function setTab(name,writeHash=true){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+name));document.querySelectorAll('.tab').forEach(b=>{const active=b.dataset.tab===name; b.classList.toggle('active',active); b.setAttribute('aria-selected',active?'true':'false');}); if(writeHash) location.hash='tab='+name;}
 function activeTabFromHash(){const raw=(location.hash||'').replace(/^#/,''); return raw.startsWith('tab=')?raw.slice(4):'lab';}
 function fetchJson(url){
-  const controller=new AbortController();
-  const timeout=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS);
-  return fetch(url,{cache:'no-store',signal:controller.signal}).then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); return r.json();}).finally(()=>clearTimeout(timeout));
+  const origins=[], seen=new Set();
+  [uiState.apiOrigin, ...uiState.candidateOrigins, ''].forEach(origin=>{const key=origin||'__relative__'; if(!seen.has(key)){seen.add(key); origins.push(origin||'');}});
+  let chain=Promise.reject(new Error('init'));
+  origins.forEach(origin=>{
+    chain=chain.catch(()=>{
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS);
+      const target=origin?(origin+url):url;
+      return fetch(target,{cache:'no-store',signal:controller.signal,mode:'cors'}).then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); uiState.apiOrigin=origin||''; rememberOrigin(origin||location.origin); return r.json();}).finally(()=>clearTimeout(timeout));
+    });
+  });
+  return chain;
 }
-function act(q){return fetchJson('/api/action?'+q).then(()=>fetchData(true)).catch(()=>{put('cmScanNote','Falha ao enviar comando.');});}
-function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){put('cmScanNote','Informe um SSID para conectar.'); return;} put('cmLanNote','Pedido de conexao enviado. Aguarde DHCP e veja o novo IP.'); act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on');}
-function sendLoraPayload(){const p=$('lrPayload').value.trim(); if(!p){put('lrNote','Informe um payload manual antes de enviar.'); return;} act('lora_payload='+encodeURIComponent(p));}
-['cmStaSsid','cmStaPass'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>e.dataset.user='1');});
+function pausePolling(ms){uiState.pauseUntil=Math.max(uiState.pauseUntil,Date.now()+ms);}
+function act(q){if(q.includes('wifi=')||q.includes('sta=')||q.includes('sta_ssid=')||q.includes('lora=')||q.includes('rescan=1')) pausePolling(9000); return fetchJson('/api/action?'+q).then(()=>fetchData(true)).catch(()=>{put('cmScanNote','Falha ao enviar comando.'); put('lrDeckNote','Falha ao enviar comando para o radio.');});}
+function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){put('cmScanNote','Informe um SSID para conectar.'); return;} pausePolling(12000); put('cmLanNote','Pedido de conexao enviado. O AP deve continuar ativo em 192.168.4.1 enquanto a LAN tenta subir.'); act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on');}
+function composePayload(){const payload=$('lrPayload').value.trim(), target=$('lrTarget').value.trim(), command=$('lrCommand').value.trim(); if(uiState.activeProfile==='free') return payload; if(uiState.activeProfile==='meshcore') return ['MC',target||'broadcast',command||'beacon',payload||'hello mesh'].join('|'); if(uiState.activeProfile==='meshtastic') return ['MT',target||'^all',command||'text',payload||'ping team'].join('|'); return 'IOT;node='+(target||'sensor-a')+';cmd='+(command||'uplink')+';data='+(payload||'temp=24.6,hum=51');}
+function refreshPayloadPreview(){put('lrPreview',txt(composePayload(),'--'));}
+function selectProtocol(name){uiState.activeProfile=name; document.querySelectorAll('.protocol').forEach(btn=>btn.classList.toggle('active',btn.dataset.profile===name)); const preset=profileDefs[name]||profileDefs.free; put('lrProfileHint',preset.hint); [['lrTarget',preset.target],['lrCommand',preset.command],['lrPayload',preset.payload]].forEach(([id,value])=>{const e=$(id); if(e&&(!e.value||e.dataset.user!=='1')) e.value=value;}); refreshPayloadPreview();}
+function sendLoraPayload(){const p=composePayload().trim(); if(!p){put('lrDeckNote','Informe um payload antes de transmitir.'); return;} put('lrDeckNote','Transmitindo: '+p); act('lora_payload='+encodeURIComponent(p));}
+['cmStaSsid','cmStaPass','lrTarget','lrCommand','lrPayload'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>{e.dataset.user='1'; refreshPayloadPreview();});});
 function renderWifiNetworks(networks){const box=$('wifiList'); if(!box)return; box.innerHTML=''; if(!networks||!networks.length){const empty=document.createElement('div'); empty.className='muted'; empty.textContent='Nenhuma rede encontrada neste scan.'; box.appendChild(empty); return;} networks.forEach(n=>{const btn=document.createElement('button'); btn.type='button'; btn.className='network-item'; btn.addEventListener('click',()=>selectNetwork(n.ssid||'')); const left=document.createElement('span'); left.textContent=(n.ssid&&n.ssid.length)?n.ssid:'(oculta)'; const right=document.createElement('span'); right.className='network-meta'; right.textContent=(n.enc?'Senha':'Aberta')+' | '+n.rssi+' dBm'; btn.appendChild(left); btn.appendChild(right); box.appendChild(btn);});}
-function scanWifi(){const btn=$('btnScanWifi'); if(btn) btn.disabled=true; renderWifiNetworks([]); put('cmScanNote','Varrendo redes Wi-Fi...'); fetchJson('/api/scan').then(d=>{renderWifiNetworks(d.networks||[]); put('cmScanNote',txt(d.note,d.ok?'Scan concluido':'Falha no scan')); put('cmScanSummary',txt(d.note,d.ok?'Scan concluido':'Falha no scan'));}).catch(()=>{put('cmScanNote','Erro ao executar o scan.'); put('cmScanSummary','Erro ao executar o scan.');}).finally(()=>{if(btn) btn.disabled=false;});}
+function scanWifi(){const btn=$('btnScanWifi'); if(btn) btn.disabled=true; pausePolling(7000); renderWifiNetworks([]); put('cmScanNote','Varrendo redes Wi-Fi...'); fetchJson('/api/scan').then(d=>{renderWifiNetworks(d.networks||[]); put('cmScanNote',txt(d.note,d.ok?'Scan concluido':'Falha no scan')); put('cmScanSummary',txt(d.note,d.ok?'Scan concluido':'Falha no scan'));}).catch(()=>{put('cmScanNote','Erro ao executar o scan.'); put('cmScanSummary','Erro ao executar o scan.');}).finally(()=>{if(btn) btn.disabled=false;});}
 function selectNetwork(ssid){const e=$('cmStaSsid'); if(e){e.value=ssid; e.dataset.user='1';} const p=$('cmStaPass'); if(p) p.focus();}
 function plotSky(sats){const cvs=$('skyplot'); if(!cvs)return; const r=cvs.width=cvs.offsetWidth, h=cvs.height=cvs.offsetHeight, ctx=cvs.getContext('2d'), cx=r/2, cy=h/2, maxR=cx*0.9; ctx.clearRect(0,0,r,h); ctx.strokeStyle='#21445f'; ctx.lineWidth=1; [1,0.66,0.33].forEach(f=>{ctx.beginPath(); ctx.arc(cx,cy,maxR*f,0,2*Math.PI); ctx.stroke();}); for(let i=0;i<12;i++){ctx.beginPath();const a=i*30*Math.PI/180; ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(a)*maxR, cy+Math.sin(a)*maxR); ctx.stroke();} if(!sats||!sats.length)return; sats.forEach(s=>{const el=Math.max(0,Math.min(90,s.e)), az=s.a||0, dist=maxR*(90-el)/90, ang=(az-90)*Math.PI/180, px=cx+Math.cos(ang)*dist, py=cy+Math.sin(ang)*dist; let c='#41d39b'; if(s.t==='R')c='#c872ff'; else if(s.t==='B')c='#ff7a59'; else if(s.t==='E')c='#6fd6ff'; ctx.beginPath(); ctx.arc(px,py,s.s>0?6:4,0,2*Math.PI); ctx.fillStyle=s.s>0?c:'rgba(150,150,150,0.5)'; ctx.fill(); ctx.strokeStyle='#000'; ctx.stroke(); ctx.fillStyle='#fff'; ctx.font='10px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(s.p, px, py-10);});}
 function drawAH(pitch,roll){const cvs=$('ahCanvas'); if(!cvs)return; const w=cvs.width,h=cvs.height,ctx=cvs.getContext('2d'),cx=w/2,cy=h/2; ctx.save(); ctx.clearRect(0,0,w,h); ctx.translate(cx,cy); ctx.rotate(-roll*Math.PI/180); const pitchPx=pitch*2; ctx.fillStyle='#1a6fb5'; ctx.fillRect(-w,-h/2+pitchPx,w*2,h); ctx.fillStyle='#7a4a1e'; ctx.fillRect(-w,pitchPx,w*2,h); ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(-w,pitchPx); ctx.lineTo(w,pitchPx); ctx.stroke(); [30,60].forEach(a=>{ctx.save(); ctx.rotate(a*Math.PI/180); ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,-cy+10); ctx.lineTo(0,-cy+20); ctx.stroke(); ctx.restore(); ctx.save(); ctx.rotate(-a*Math.PI/180); ctx.beginPath(); ctx.moveTo(0,-cy+10); ctx.lineTo(0,-cy+20); ctx.stroke(); ctx.restore();}); ctx.restore(); ctx.strokeStyle='#FFD34D'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(cx-30,cy); ctx.lineTo(cx-10,cy); ctx.lineTo(cx-10,cy+8); ctx.stroke(); ctx.beginPath(); ctx.moveTo(cx+30,cy); ctx.lineTo(cx+10,cy); ctx.lineTo(cx+10,cy+8); ctx.stroke(); ctx.beginPath(); ctx.arc(cx,cy,4,0,2*Math.PI); ctx.fillStyle='#FFD34D'; ctx.fill();}
+function ago(ms){if(ms===undefined||ms===null||Number.isNaN(ms)) return '--'; if(ms<1000) return ms+' ms'; if(ms<60000) return (ms/1000).toFixed(1)+' s'; return (ms/60000).toFixed(1)+' min';}
+function setMeter(id,pct){const e=$(id); if(!e)return; e.style.width=Math.max(6,Math.min(100,pct))+'%';}
+function buildSpectrum(seed,rx,tx,receiving){const bins=72, trace=Array.from({length:bins},(_,i)=>14+Math.sin((i+rx)*0.18)*8+Math.cos((i+tx)*0.11)*5); const text=String(seed||''); for(let i=0;i<text.length;i++){const code=text.charCodeAt(i), idx=code%bins; trace[idx]+=18+((code>>2)%20); if(idx+1<bins) trace[idx+1]+=8; if(idx>0) trace[idx-1]+=5;} if(receiving){trace[(rx+tx)%bins]+=34; trace[(rx+17)%bins]+=18;} return trace.map(v=>Math.max(6,Math.min(100,v)));}
+function drawSpectrum(trace,receiving){const cvs=$('loraScope'); if(!cvs)return; const ctx=cvs.getContext('2d'), w=cvs.width, h=cvs.height; ctx.clearRect(0,0,w,h); const grad=ctx.createLinearGradient(0,0,0,h); grad.addColorStop(0,'#0f2136'); grad.addColorStop(1,'#060c15'); ctx.fillStyle=grad; ctx.fillRect(0,0,w,h); ctx.strokeStyle='rgba(103,165,224,.14)'; ctx.lineWidth=1; for(let i=1;i<5;i++){const y=(h/5)*i; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();} for(let i=1;i<9;i++){const x=(w/9)*i; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();} ctx.beginPath(); ctx.strokeStyle=receiving?'#8fffd0':'#69d8ff'; ctx.lineWidth=2.4; trace.forEach((v,i)=>{const x=(i/(trace.length-1))*w, y=h-(v/100)*(h-18)-9; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);}); ctx.stroke();}
+function drawWaterfall(trace){const cvs=$('loraWaterfall'); if(!cvs)return; uiState.waterfall.unshift(trace.slice()); if(uiState.waterfall.length>cvs.height) uiState.waterfall.length=cvs.height; const ctx=cvs.getContext('2d'), w=cvs.width, h=cvs.height, image=ctx.createImageData(w,h), bins=trace.length; for(let y=0;y<h;y++){const row=uiState.waterfall[y]||Array.from({length:bins},()=>0); for(let x=0;x<w;x++){const v=row[Math.min(bins-1,Math.floor((x/w)*bins))]||0, offset=(y*w+x)*4; image.data[offset]=Math.min(255,20+v*2.1); image.data[offset+1]=Math.min(255,18+v*1.4); image.data[offset+2]=Math.min(255,36+v*2.6); image.data[offset+3]=255;}} ctx.putImageData(image,0,0);}
+function renderRadioVisual(d){const seed=txt(d.lora.last_rx_message||d.lora.last_message||d.lora.last_tx_payload,''), trace=buildSpectrum(seed,Number(d.lora.rx_bytes)||0,Number(d.lora.tx_bytes)||0,!!d.lora.receiving); drawSpectrum(trace,!!d.lora.receiving); drawWaterfall(trace); setMeter('lrRxMeter',Math.min(100,(Number(d.lora.rx_bytes)||0)%101)); setMeter('lrTxMeter',Math.min(100,(Number(d.lora.tx_bytes)||0)%101));}
+function parseTrackerPacket(text){
+  const raw=(text||'').trim();
+  if(!raw) return null;
+  const getField=(keys)=>{for(const key of keys){const rx=new RegExp('(?:^|[|,;\\s])'+key+'\\s*[:=]\\s*(-?\\d+(?:\\.\\d+)?)','i'); const m=raw.match(rx); if(m) return Number(m[1]);} return null;};
+  const lat=getField(['lat','latitude']);
+  const lon=getField(['lon','lng','long','longitude']);
+  const alt=getField(['alt','altitude']);
+  const spd=getField(['spd','speed','vel']);
+  const course=getField(['crs','course','cog','heading']);
+  let pair=null;
+  if(lat===null||lon===null){const m=raw.match(/(-?\d{1,2}\.\d{4,})\s*[, ]\s*(-?\d{1,3}\.\d{4,})/); if(m) pair={lat:Number(m[1]),lon:Number(m[2])};}
+  const finalLat=lat!==null?lat:(pair?pair.lat:null);
+  const finalLon=lon!==null?lon:(pair?pair.lon:null);
+  if(finalLat===null||finalLon===null||Math.abs(finalLat)>90||Math.abs(finalLon)>180) return null;
+  let node='desconhecido';
+  const nodeMatch=raw.match(/(?:node|id|dev|device|call|callsign|name|src|from)\s*[:=]\s*([A-Za-z0-9_\-]+)/i);
+  if(nodeMatch) node=nodeMatch[1];
+  else if(raw.startsWith('RX ')||raw.startsWith('TX ')){const bits=raw.split(/[|,;]/).map(v=>v.trim()).filter(Boolean); if(bits.length) node=bits[0].replace(/^RX\s+/i,'').replace(/^TX\s+/i,'');}
+  return {raw,node,lat:finalLat,lon:finalLon,alt,spd,course};
+}
+function fmtCoord(v){return (v===null||v===undefined||Number.isNaN(v))?'--':v.toFixed(6);}
+function trackerLinks(pkt){if(!pkt) return {osm:'',google:''}; return {osm:'https://www.openstreetmap.org/?mlat='+pkt.lat.toFixed(6)+'&mlon='+pkt.lon.toFixed(6)+'#map=15/'+pkt.lat.toFixed(6)+'/'+pkt.lon.toFixed(6),google:'https://www.google.com/maps?q='+pkt.lat.toFixed(6)+','+pkt.lon.toFixed(6)};}
+function updateTracker433(d,includeHeavy){
+  const latest=parseTrackerPacket(txt(d.lora.last_rx_message,''))||parseTrackerPacket(txt(d.lora.last_message,''))||parseTrackerPacket(txt(d.lora.last_tx_payload,''));
+  if(!latest){
+    put('tr433State',d.lora.enabled?'Aguardando pacote GPS':'Radio desligado'); put('tr433Node','--'); put('tr433LatLon','--'); put('tr433Age',ago(d.lora.last_rx_ms)); put('tr433Lat','--'); put('tr433Lon','--'); put('tr433Alt','--'); put('tr433Speed','--'); put('tr433Course','--'); put('tr433Source','Sem coordenadas detectadas'); put('tr433Raw',txt(d.lora.last_rx_message||d.lora.last_message)); put('tr433History',includeHeavy?multi(d.lora.history):txt(d.lora.last_rx_message||d.lora.last_message)); linkify('tr433Osm','','OpenStreetMap'); linkify('tr433Google','','Google Maps'); return;
+  }
+  const links=trackerLinks(latest);
+  put('tr433State','Fix detectado'); put('tr433Node',latest.node||'--'); put('tr433LatLon',fmtCoord(latest.lat)+', '+fmtCoord(latest.lon)); put('tr433Age',ago(d.lora.last_rx_ms)); put('tr433Lat',fmtCoord(latest.lat)); put('tr433Lon',fmtCoord(latest.lon)); put('tr433Alt',latest.alt===null?'--':num(latest.alt,' m')); put('tr433Speed',latest.spd===null?'--':num(latest.spd,' km/h')); put('tr433Course',latest.course===null?'--':num(latest.course,' deg')); put('tr433Source','Payload UART LoRa 433'); put('tr433Raw',latest.raw); linkify('tr433Osm',links.osm,'OpenStreetMap'); linkify('tr433Google',links.google,'Google Maps');
+  if(includeHeavy){
+    const lines=multi(d.lora.history).split('\n').map(v=>v.trim()).filter(Boolean);
+    const parsed=lines.map(parseTrackerPacket).filter(Boolean).slice(0,8).map((pkt,idx)=>String(idx+1).padStart(2,'0')+'. '+(pkt.node||'node')+' | '+fmtCoord(pkt.lat)+', '+fmtCoord(pkt.lon)+(pkt.alt!==null?' | '+pkt.alt+' m':'')+(pkt.spd!==null?' | '+pkt.spd+' km/h':''));
+    put('tr433History',parsed.length?parsed.join('\n'):'Nenhum pacote com GPS detectado no historico.');
+  }
+}
 function applyData(d,includeHeavy){
-  put('heroAp',yes(d.wifi.ap,'AP ligado','AP desligado')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?'Tentando LAN':'Sem LAN')); put('heroIp','http://'+txt(d.wifi.ip)); put('heroMode',d.runtime_light?'Modo leve':'Modo normal');
+  rememberOriginsFromData(d);
+  put('heroAp',yes(d.wifi.ap,'AP ligado','AP desligado')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?'Tentando LAN':'Sem LAN')); put('heroIp',uiState.apiOrigin||('http://'+txt(d.wifi.ip))); put('heroMode',d.runtime_light?'Modo leve':'Modo normal'); put('heroStaNote',txt(d.wifi.sta_note)); put('heroLora',yes(d.lora.enabled,'LoRa 433 pronto','LoRa 433 parado')); put('heroLoraNote',txt(d.lora.note));
   put('labBmeState',d.meteo.connected?'Ligado':'Off'); put('labImuPitch',num(d.imu.pitch_deg,' deg')); put('labImuRoll',num(d.imu.roll_deg,' deg')); put('labSdLogger',yes(d.blackbox.logging_enabled,'Gravando','Pausado'));
   put('labGpsState',d.gps.fix?'Fix OK':(d.gps.receiving?'NMEA RX':'Aguardando')); put('labGpsFix',d.gps.fix?'Valido':'Sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsSentence',txt(d.gps.last_sentence));
-  put('labLoraState',yes(d.lora.enabled,'UART ativa','UART desligada')); put('lrRx2',txt(d.lora.rx_bytes)); put('lrTx2',txt(d.lora.tx_bytes)); put('lrAux2',d.lora.aux_high?'HIGH':'LOW'); put('lrMsg2',txt(d.lora.last_message));
+  put('labLoraState',yes(d.lora.enabled,'433 ativa','433 desligada')); put('lrRx2',txt(d.lora.rx_bytes)); put('lrTx2',txt(d.lora.tx_bytes)); put('lrAux2',d.lora.aux_high?'HIGH':'LOW'); put('lrMsg2',txt(d.lora.last_message));
   put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsRate',txt(d.gps.update_hz)+' Hz'); put('gpsLastRx',txt(d.gps.last_rx_ms)+' ms'); put('gpsSentence',txt(d.gps.last_sentence));
   linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps');
   if(d.sats_arr){plotSky(d.sats_arr); const total=d.sats_arr.length, gpsCount=d.sats_arr.filter(s=>s.t==='G').length, glo=d.sats_arr.filter(s=>s.t==='R').length, bds=d.sats_arr.filter(s=>s.t==='B').length, gal=d.sats_arr.filter(s=>s.t==='E').length; put('skpTotal',total+' sats visiveis'); put('skpGps','GPS '+gpsCount); put('skpGlo','GLO '+glo); put('skpBds','BDS '+bds); put('skpGal','GAL '+gal);}
   put('sdMounted',yes(d.blackbox.mounted,'montado','sem cartao')); put('sdLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('sdFile',txt(d.blackbox.file_name)); put('sdRecords',txt(d.blackbox.records)); put('sdSize',txt(d.blackbox.card_size_bytes));
   put('mtTheme',txt(d.meteo.theme)); put('mtSummary',txt(d.meteo.summary)); put('mtTemp',num(d.meteo.temperature_c,' C')); put('mtHum',num(d.meteo.humidity_pct,' %')); put('mtPress',num(d.meteo.pressure_hpa,' hPa')); put('mtAlt',num(d.meteo.altitude_m,' m')); put('mtGas',num(d.meteo.gas_ohms,' ohms'));
-  put('lrState',yes(d.lora.enabled,'ATIVO','DESLIGADO')); put('lrUart',yes(d.lora.uart_ready,'OK','OFF')); put('lrAux',d.lora.aux_high?'HIGH':'LOW'); put('lrRxState',d.lora.receiving?'recebendo':'idle'); put('lrLastRx',txt(d.lora.last_rx_message)); put('lrLastTx',txt(d.lora.last_tx_payload)); put('lrRxBytes',txt(d.lora.rx_bytes)); put('lrTxBytes',txt(d.lora.tx_bytes)); put('lrNote',txt(d.lora.note)); put('lrAutoState',d.lora.auto_tx_enabled?'ATIVO':'DESLIGADO'); put('lrAutoMode',txt(d.lora.auto_tx_mode,'summary')); put('lrAutoInterval',num((d.lora.auto_tx_interval_ms||0)/1000,' s')); put('lrAutoLast',num(d.lora.last_auto_tx_ms,' ms'));
+  put('lrState',yes(d.lora.enabled,'433 ATIVO','433 DESLIGADO')); put('lrUart',yes(d.lora.uart_ready,'UART OK','UART OFF')); put('lrAux',d.lora.aux_high?'AUX HIGH':'AUX LOW'); put('lrRxState',d.lora.receiving?'recebendo':'idle'); put('lrLastRx',txt(d.lora.last_rx_message)); put('lrLastTx',txt(d.lora.last_tx_payload)); put('lrRxBytes',txt(d.lora.rx_bytes)+' B'); put('lrTxBytes',txt(d.lora.tx_bytes)+' B'); put('lrNote',txt(d.lora.note)); put('lrAutoState',d.lora.auto_tx_enabled?'AUTO TX ON':'AUTO TX OFF'); put('lrAutoMode',txt(d.lora.auto_tx_mode,'summary')); put('lrAutoInterval',num((d.lora.auto_tx_interval_ms||0)/1000,' s')); put('lrAutoLast',ago(d.lora.last_auto_tx_ms)); put('lrDeckNote',txt(d.lora.console_note)); renderRadioVisual(d); updateTracker433(d,includeHeavy);
   put('cmMode',txt(d.wifi.mode)); put('cmApState',yes(d.wifi.ap,'Ligado','Desligado')); put('cmLanState',d.wifi.sta_connected?'Conectado':(d.wifi.sta_requested?'Tentando':'Desligado')); put('cmStaIp',txt(d.wifi.sta_ip)); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); put('cmWifiNote',txt(d.wifi.note)); put('cmLanNote',txt(d.wifi.sta_note)); put('cmScanNote',txt(d.wifi.scan_summary)); put('cmScanSummary',txt(d.wifi.scan_summary)); val('cmStaSsid',txt(d.wifi.sta_ssid,''));
   put('cfScreen',txt(d.screen_label)); put('cfMode',d.runtime_light?'leve':'normal'); put('cfOrientation',txt(d.ui.orientation)); put('cfRotation',txt(d.ui.rotation)); put('cfWifi',d.wifi.ap?('AP '+txt(d.wifi.mode)):txt(d.wifi.mode)); put('cfLora',yes(d.lora.enabled,'Ligado','Desligado')); put('cfLogger',yes(d.blackbox.logging_enabled,'Ligado','Pausado')); put('cfFile',txt(d.blackbox.file)); put('cfRecords',txt(d.blackbox.records)); put('cfNote',txt(d.blackbox.note)); put('cfSensors',txt(d.sensors.known)); put('cfScan',txt(d.sensors.scan));
   put('ovUptime',num(d.uptime_s,' s')); put('ovScreen',txt(d.screen_label)); put('ovRuntime',d.runtime_light?'Modo leve':'Modo normal'); put('ovIp','http://'+txt(d.wifi.ip)); put('ovNetMode',txt(d.wifi.mode)); put('ovAp',yes(d.wifi.ap,'Ligado','Desligado')); put('ovLan',d.wifi.sta_connected?txt(d.wifi.sta_ip):txt(d.wifi.sta_note)); put('ovClients',txt(d.wifi.clients)); put('ovHits',txt(d.wifi.web_hits)); put('ovGps',d.gps.fix?'Fix OK':(d.gps.receiving?'NMEA RX':'Sem GPS')); put('ovSats',txt(d.gps.sats)); put('ovTemp',num(d.meteo.temperature_c,' C')); put('ovHum',num(d.meteo.humidity_pct,' %')); put('ovPress',num(d.meteo.pressure_hpa,' hPa')); put('ovLora',yes(d.lora.enabled,'Ligado','Desligado')); put('ovLoraFlow',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes)+' bytes'); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records));
@@ -4114,16 +4653,18 @@ function applyData(d,includeHeavy){
 }
 function fetchDetails(force){
   const now=Date.now();
-  if(detailBusy||(!force&&now-lastDetailAt<DETAIL_INTERVAL_MS)) return Promise.resolve();
-  detailBusy=true;
-  return fetchJson('/api/status?detail=1').then(d=>{applyData(d,true); lastDetailAt=Date.now();}).catch(()=>{}).finally(()=>{detailBusy=false;});
+  if(uiState.detailBusy||(!force&&now-uiState.lastDetailAt<DETAIL_INTERVAL_MS)) return Promise.resolve();
+  uiState.detailBusy=true;
+  return fetchJson('/api/status?detail=1').then(d=>{applyData(d,true); uiState.lastDetailAt=Date.now();}).catch(()=>{}).finally(()=>{uiState.detailBusy=false;});
 }
 function fetchData(forceDetails){
-  if(statusBusy) return;
-  statusBusy=true;
-  fetchJson('/api/status').then(d=>{applyData(d,false); return fetchDetails(!!forceDetails);}).catch(()=>{put('heroLan','Sem resposta do servidor'); put('cmScanNote','Falha ao atualizar o painel web.');}).finally(()=>{statusBusy=false;});
+  if(Date.now()<uiState.pauseUntil) return;
+  if(uiState.statusBusy) return;
+  uiState.statusBusy=true;
+  fetchJson('/api/status').then(d=>{applyData(d,false); return fetchDetails(!!forceDetails);}).catch(()=>{const candidates=uiState.candidateOrigins.filter(Boolean).slice(0,2).join(' | '); put('heroLan','Sem resposta do servidor'); put('cmScanNote',candidates?('Falha ao atualizar. Tente: '+candidates):'Falha ao atualizar o painel web.'); put('lrDeckNote','Sem resposta do radio via API.');}).finally(()=>{uiState.statusBusy=false;});
 }
 window.addEventListener('hashchange',()=>setTab(activeTabFromHash(),false));
+selectProtocol('meshcore');
 setTab(activeTabFromHash(),false);
 fetchData(true);
 setInterval(()=>fetchData(false),STATUS_INTERVAL_MS);
@@ -4168,6 +4709,43 @@ static void sendHttpActiveLogDownload(NetworkClient &client)
     uint8_t chunk[256];
     const size_t read_n = file.read(chunk, sizeof(chunk));
     if (read_n == 0) {
+      break;
+    }
+    client.write(chunk, read_n);
+  }
+  file.close();
+}
+
+static void sendHttpLoraCaptureDownload(NetworkClient &client)
+{
+  const BlackboxState blackbox = copyBlackboxState();
+  if (!blackbox.mounted) {
+    sendHttpTextDownload(client, "lora433_capture_unavailable.txt", "SD indisponivel para exportar as capturas 433.\n");
+    return;
+  }
+
+  drainLoraCaptureLogsToSd();
+  if (!SD.exists("/logs/lora433_capture.csv")) {
+    sendHttpTextDownload(client, "lora433_capture_empty.txt", "Ainda nao existem capturas 433 gravadas no SD.\n");
+    return;
+  }
+
+  File file = SD.open("/logs/lora433_capture.csv", FILE_READ);
+  if (!file) {
+    sendHttpTextDownload(client, "lora433_capture_open_error.txt", "Falha ao abrir o arquivo de capturas 433.\n");
+    return;
+  }
+
+  client.print(F("HTTP/1.1 200 OK\r\n"));
+  client.print(F("Content-Type: text/csv; charset=utf-8\r\n"));
+  client.print(F("Cache-Control: no-store\r\n"));
+  client.print(F("Connection: close\r\n"));
+  client.print(F("Content-Disposition: attachment; filename=\"lora433_capture.csv\"\r\n\r\n"));
+
+  while (file.available()) {
+    uint8_t chunk[256];
+    const size_t read_n = file.read(chunk, sizeof(chunk));
+    if (read_n == 0U) {
       break;
     }
     client.write(chunk, read_n);
@@ -4235,7 +4813,9 @@ static void handleWifiPortal()
       request_path,
       static_cast<unsigned long>(ESP.getFreeHeap()));
 
-  if (strncmp(request_path, "/api/action", 11) == 0) {
+  if (strncmp(request_path, "/favicon.ico", 12) == 0) {
+    client.print(F("HTTP/1.1 204 No Content\r\nCache-Control: max-age=600\r\nConnection: close\r\n\r\n"));
+  } else if (strncmp(request_path, "/api/action", 11) == 0) {
     handleHttpActionPath(request_path);
     sendHttpJsonStatus(client, false);
   } else if (strncmp(request_path, "/api/status", 11) == 0) {
@@ -4245,6 +4825,8 @@ static void handleWifiPortal()
     sendHttpJsonStatus(client, include_details);
   } else if (strncmp(request_path, "/download/blackbox", 18) == 0) {
     sendHttpActiveLogDownload(client);
+  } else if (strncmp(request_path, "/download/lora433", 17) == 0) {
+    sendHttpLoraCaptureDownload(client);
   } else if (strncmp(request_path, "/download/lora", 14) == 0) {
     char export_text[2000];
     formatLoraExportText(export_text, sizeof(export_text));
@@ -5541,6 +6123,13 @@ static void blackboxTask(void *parameter)
       }
 
       storeBlackboxState(state);
+    }
+
+    if (state.mounted) {
+      const uint8_t capture_written = drainLoraCaptureLogsToSd();
+      if (capture_written > 0U) {
+        Serial.printf("[LORA433] %u captura(s) persistidas em /logs/lora433_capture.csv\n", static_cast<unsigned>(capture_written));
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(120));
@@ -7882,11 +8471,9 @@ void setup()
       GPS_UART_RX_PIN,
       GPS_UART_TX_PIN,
       static_cast<unsigned long>(GPS_UART_BAUD));
-  pinMode(LORA_M0_PIN, OUTPUT);
-  pinMode(LORA_M1_PIN, OUTPUT);
+  pinMode(LORA_M0_PIN, INPUT_PULLUP);
+  pinMode(LORA_M1_PIN, INPUT_PULLUP);
   pinMode(LORA_AUX_PIN, INPUT_PULLUP);
-  digitalWrite(LORA_M0_PIN, LOW);
-  digitalWrite(LORA_M1_PIN, LOW);
   Serial2.begin(LORA_UART_BAUD, SERIAL_8N1, LORA_UART_RX_PIN, LORA_UART_TX_PIN);
   g_lora_uart_ready = true;
   clearLoraHistory();
@@ -7901,12 +8488,12 @@ void setup()
   snprintf(
       lora_state.note,
       sizeof(lora_state.note),
-      "UART LoRa pronta | RX=%d TX=%d | AUX=%d",
+      "UART LoRa 433 pronta | monitoramento ativo | RX=%d TX=%d | AUX=%d | M0/M1 em alta impedancia",
       LORA_UART_RX_PIN,
       LORA_UART_TX_PIN,
       LORA_AUX_PIN);
   storeLoraState(lora_state);
-  Serial.printf("[LORA] UART pronta | TX=%d RX=%d M0=%d M1=%d AUX=%d | baud=%lu\n", LORA_UART_TX_PIN, LORA_UART_RX_PIN, LORA_M0_PIN, LORA_M1_PIN, LORA_AUX_PIN, static_cast<unsigned long>(LORA_UART_BAUD));
+  Serial.printf("[LORA] UART 433 pronta | TX=%d RX=%d M0=%d M1=%d AUX=%d | baud=%lu | M0/M1 hi-z\n", LORA_UART_TX_PIN, LORA_UART_RX_PIN, LORA_M0_PIN, LORA_M1_PIN, LORA_AUX_PIN, static_cast<unsigned long>(LORA_UART_BAUD));
 
   initDisplay();
   initTouch();
