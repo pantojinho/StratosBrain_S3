@@ -194,7 +194,7 @@ static constexpr uint8_t WIFI_AP_MAX_CONNECTIONS = 4;
 static constexpr uint32_t WIFI_STATUS_SERIAL_MS = 15000U;
 static constexpr bool ENABLE_AUTO_ROTATION_UI = false;
 static constexpr uint16_t WIFI_WEB_PORT = 80;
-static constexpr uint32_t WIFI_CLIENT_TIMEOUT_MS = 350U;
+static constexpr uint32_t WIFI_CLIENT_TIMEOUT_MS = 1200U;
 static constexpr size_t WIFI_STA_SSID_LEN = 33;
 static constexpr size_t WIFI_STA_PASSWORD_LEN = 65;
 static constexpr char WIFI_STA_DEFAULT_SSID[] = "";
@@ -2763,6 +2763,7 @@ static void startWifiPortal()
   g_wifi_ap_started = want_ap;
   g_wifi_sta_started = want_sta;
   updateWifiRequestedFlag();
+  g_web_server.stop();
   g_web_server.begin();
   g_web_server.setNoDelay(true);
   g_wifi_web_started = true;
@@ -3438,7 +3439,7 @@ static void handleHttpActionPath(const char *path)
   }
 }
 
-static void sendHttpJsonStatus(NetworkClient &client)
+static void sendHttpJsonStatus(NetworkClient &client, bool include_details)
 {
   const ImuState imu = copyImuState();
   const BlackboxState blackbox = copyBlackboxState();
@@ -3478,6 +3479,12 @@ static void sendHttpJsonStatus(NetworkClient &client)
   sanitizeJsonText(g_sensor_scan_compact_cache.c_str(), scratch.sensor_scan_raw, sizeof(scratch.sensor_scan_raw));
   sanitizeJsonText(g_sensor_bosch_cache.c_str(), scratch.sensor_bosch, sizeof(scratch.sensor_bosch));
   sanitizeJsonText(g_sensor_route_cache.c_str(), scratch.sensor_routes, sizeof(scratch.sensor_routes));
+  const char *blackbox_tail_json = include_details ? scratch.blackbox_tail : "";
+  const char *blackbox_files_json = include_details ? scratch.blackbox_files : "";
+  const char *gps_history_json = include_details ? scratch.gps_history : "";
+  const char *lora_history_json = include_details ? scratch.lora_history : "";
+  const char *lora_export_json = include_details ? scratch.lora_export : "";
+  const char *activity_history_json = include_details ? scratch.activity_history : "";
 
   const bool plane_has_altitude = gps.has_fix;
   const bool plane_has_speed = gps.receiving || gps.has_fix;
@@ -3517,20 +3524,21 @@ static void sendHttpJsonStatus(NetworkClient &client)
   client.print(F("HTTP/1.1 200 OK\r\n"));
   client.print(F("Content-Type: application/json; charset=utf-8\r\n"));
   client.print(F("Cache-Control: no-store\r\n"));
+  client.print(F("Access-Control-Allow-Origin: *\r\n"));
   client.print(F("Connection: close\r\n\r\n"));
   client.printf(
-      "{\"device\":\"StratosBrain S3\",\"screen\":\"%s\",\"screen_label\":\"%s\",\"runtime_light\":%s,",
+      "{\"device\":\"StratosBrain S3\",\"screen\":\"%s\",\"screen_label\":\"%s\",\"runtime_light\":%s,\"details\":%s,",
       screenIdSlug(g_current_screen_id),
       screenIdLabel(g_current_screen_id),
-      g_runtime_services_light ? "true" : "false");
+      g_runtime_services_light ? "true" : "false",
+      include_details ? "true" : "false");
   client.printf(
-      "\"wifi\":{\"mode\":\"%s\",\"ap\":%s,\"requested\":%s,\"ap_requested\":%s,\"ssid\":\"%s\",\"password\":\"%s\",\"ap_ip\":\"%s\",\"sta_requested\":%s,\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\",\"ip\":\"%s\",\"clients\":%u,\"web_hits\":%lu,\"scan_count\":%u,\"note\":\"%s\",\"sta_note\":\"%s\",\"scan_summary\":\"%s\"},",
+      "\"wifi\":{\"mode\":\"%s\",\"ap\":%s,\"requested\":%s,\"ap_requested\":%s,\"ssid\":\"%s\",\"password\":\"\",\"ap_ip\":\"%s\",\"sta_requested\":%s,\"sta_connected\":%s,\"sta_ssid\":\"%s\",\"sta_ip\":\"%s\",\"ip\":\"%s\",\"clients\":%u,\"web_hits\":%lu,\"scan_count\":%u,\"note\":\"%s\",\"sta_note\":\"%s\",\"scan_summary\":\"%s\"},",
       wifiModeLabel(),
       g_wifi_ap_started ? "true" : "false",
       g_wifi_mode_requested ? "true" : "false",
       g_wifi_ap_requested ? "true" : "false",
       WIFI_AP_SSID,
-      WIFI_AP_PASSWORD,
       scratch.ap_ip_text,
       g_wifi_sta_requested ? "true" : "false",
       g_wifi_sta_connected ? "true" : "false",
@@ -3607,7 +3615,7 @@ static void sendHttpJsonStatus(NetworkClient &client)
       scratch.gps_map_osm,
       scratch.gps_map_google,
       scratch.gps_map_hint,
-      scratch.gps_history);
+      gps_history_json);
   client.printf(
       "\"lora\":{\"enabled\":%s,\"uart_ready\":%s,\"aux_high\":%s,\"receiving\":%s,\"rx_bytes\":%lu,\"tx_bytes\":%lu,\"last_rx_ms\":%lu,\"last_tx_ms\":%lu,\"last_message\":\"%s\",\"last_rx_message\":\"%s\",\"last_tx_payload\":\"%s\",\"auto_tx_enabled\":%s,\"auto_tx_interval_ms\":%lu,\"last_auto_tx_ms\":%lu,\"auto_tx_mode\":\"%s\",\"note\":\"%s\",\"history\":\"%s\",\"export\":\"%s\",\"console_note\":\"Console de payload UART LoRa. Nao e analisador SDR/RF.\"},",
       lora.enabled ? "true" : "false",
@@ -3626,9 +3634,9 @@ static void sendHttpJsonStatus(NetworkClient &client)
       static_cast<unsigned long>(lora.last_auto_tx_ms),
       scratch.lora_auto_mode,
       scratch.lora_note,
-      scratch.lora_history,
-      scratch.lora_export);
-  client.printf("\"activity\":{\"recent\":\"%s\"},", scratch.activity_history);
+      lora_history_json,
+      lora_export_json);
+  client.printf("\"activity\":{\"recent\":\"%s\"},", activity_history_json);
   client.printf(
       "\"comms\":{\"lora_enabled\":%s,\"lora_uart_ready\":%s,\"gps_fix\":%s,\"gps_uart_ready\":%s,\"gps_receiving\":%s},",
       g_lora_enabled ? "true" : "false",
@@ -3653,8 +3661,8 @@ static void sendHttpJsonStatus(NetworkClient &client)
       scratch.blackbox_file,
       scratch.blackbox_name,
       scratch.blackbox_note,
-      scratch.blackbox_tail,
-      scratch.blackbox_files);
+      blackbox_tail_json,
+      blackbox_files_json);
   client.printf(
       "\"ui\":{\"rotation\":\"%s\",\"orientation\":\"%s\"},",
       rotationLabel(g_display_rotation),
@@ -3666,6 +3674,7 @@ static void sendHttpJsonStatus(NetworkClient &client)
       scratch.sensor_scan_raw,
       scratch.sensor_bosch,
       scratch.sensor_routes);
+  client.flush();
 }
 
 static void sendHttpDashboard(NetworkClient &client)
@@ -4057,90 +4066,67 @@ a.btn{display:inline-flex;align-items:center;justify-content:center}
 </div></section>)STRATOSWEB"));
   client.print(F(R"WEBJS(<script>
 const $=i=>document.getElementById(i), txt=(v,d='--')=>(v===undefined||v===null||v==='')?d:v, toText=v=>String(txt(v));
-let __dbgPrevOvGps = null;
-let __dbgPrevGpsLastRxMs = null;
-const __dbgIngestUrl = 'http://127.0.0.1:7246/ingest/f4d2790c-f89f-424e-99d5-7e2d5529be3e';
-
-const put=(i,v)=>{
-  const e=$(i);
-  if(!e) return;
-  const next=toText(v);
-  if(e.textContent!==next) e.textContent=next;
-
-  if(i==='ovGps' && next!==__dbgPrevOvGps){
-    __dbgPrevOvGps = next;
-    const receiving = next==='NMEA RX';
-    const fix = next==='Fix OK';
-    const last_rx_ms = __dbgPrevGpsLastRxMs;
-    // #region agent log H1-gps-receiving-transition
-    fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H1-gps-receiving',location:'web:put:ovGps',message:'gps receiving transition',data:{ovGps:next,receiving:receiving,fix:fix,last_rx_ms:last_rx_ms},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
-  }
-
-  if(i==='gpsLastRx'){
-    const s=String(next);
-    const m=s.match(/(-?[0-9]+).*ms/);
-    const ms=m?parseInt(m[1],10):null;
-    if(ms!==__dbgPrevGpsLastRxMs){
-      __dbgPrevGpsLastRxMs = ms;
-      if(__dbgPrevOvGps==='Sem GPS'){
-        // #region agent log H1-gps-last-rx-ms
-        fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H1-gps-last-rx-ms',location:'web:put:gpsLastRx',message:'gps last_rx_ms changed while receiving is off',data:{last_rx_ms:ms},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
-      }
-    }
-  }
-};
-
-const __origFetch = window.fetch ? window.fetch.bind(window) : fetch;
-window.fetch = (url, opts) => {
-  if (typeof url === 'string' && url === '/api/status') {
-    const t0 = Date.now();
-    return __origFetch(url, opts)
-      .then(resp => {
-        const dt = Date.now() - t0;
-        if (!resp.ok || dt > 250) {
-          // #region agent log H3-http-status
-          fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H3-http-status',location:'web:fetch:/api/status',message:'status response timing',data:{ok:resp.ok,status:resp.status,duration_ms:dt},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
-        }
-        return resp;
-      })
-      .catch(err => {
-        const dt = Date.now() - t0;
-        // #region agent log H3-http-status-fail
-        fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H3-http-status-fail',location:'web:fetch:/api/status',message:'status fetch failed',data:{error:String(err),duration_ms:dt},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
-        throw err;
-      });
-  }
-  return __origFetch(url, opts);
-};
+const put=(i,v)=>{const e=$(i); if(!e) return; const next=toText(v); if(e.textContent!==next) e.textContent=next;};
 const val=(i,v)=>{const e=$(i); const next=toText(v); if(e&&document.activeElement!==e&&(!e.value||e.dataset.user!=='1')&&e.value!==next)e.value=next;};
 const num=(v,s='')=>(v===undefined||v===null||Number.isNaN(v))?'--':String(v)+s, yes=(v,a='ON',b='OFF')=>v?a:b;
+const STATUS_INTERVAL_MS=2500, DETAIL_INTERVAL_MS=10000, REQUEST_TIMEOUT_MS=4500;
+let statusBusy=false, detailBusy=false, lastDetailAt=0;
 function linkify(id,href,label){const e=$(id); if(!e)return; const ok=!!(href&&href!==''&&href!=='--'); e.href=ok?href:'#'; e.style.pointerEvents=ok?'auto':'none'; e.style.opacity=ok?'1':'.5'; if(label&&e.textContent!==label)e.textContent=label;}
 function setTab(name,writeHash=true){document.querySelectorAll('.section').forEach(s=>s.classList.toggle('active',s.id==='section-'+name));document.querySelectorAll('.tab').forEach(b=>{const active=b.dataset.tab===name; b.classList.toggle('active',active); b.setAttribute('aria-selected',active?'true':'false');}); if(writeHash) location.hash='tab='+name;}
 function activeTabFromHash(){const raw=(location.hash||'').replace(/^#/,''); return raw.startsWith('tab=')?raw.slice(4):'lab';}
-function act(q){
-  const isRescan = typeof q === 'string' && q.indexOf('rescan=1') !== -1;
-  if (isRescan) {
-    // #region agent log H2-rescan-start
-    fetch(__dbgIngestUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'log_'+Date.now(),runId:'pre-debug',hypothesisId:'H2-heap-frag-after-rescan',location:'web:act',message:'rescan requested',data:{q:q},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
-  }
-  return fetch('/api/action?'+q).then(r=>r.json()).then(()=>fetchData()).catch(err=>{console.log('Action error',err);});
+function fetchJson(url){
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),REQUEST_TIMEOUT_MS);
+  return fetch(url,{cache:'no-store',signal:controller.signal}).then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); return r.json();}).finally(()=>clearTimeout(timeout));
 }
+function act(q){return fetchJson('/api/action?'+q).then(()=>fetchData(true)).catch(()=>{put('cmScanNote','Falha ao enviar comando.');});}
 function connectSta(){const ssid=$('cmStaSsid').value.trim(), pass=$('cmStaPass').value; if(!ssid){put('cmScanNote','Informe um SSID para conectar.'); return;} put('cmLanNote','Pedido de conexao enviado. Aguarde DHCP e veja o novo IP.'); act('sta_ssid='+encodeURIComponent(ssid)+'&sta_pass='+encodeURIComponent(pass)+'&sta=on');}
 function sendLoraPayload(){const p=$('lrPayload').value.trim(); if(!p){put('lrNote','Informe um payload manual antes de enviar.'); return;} act('lora_payload='+encodeURIComponent(p));}
 ['cmStaSsid','cmStaPass'].forEach(id=>{const e=$(id); if(e)e.addEventListener('input',()=>e.dataset.user='1');});
 function renderWifiNetworks(networks){const box=$('wifiList'); if(!box)return; box.innerHTML=''; if(!networks||!networks.length){const empty=document.createElement('div'); empty.className='muted'; empty.textContent='Nenhuma rede encontrada neste scan.'; box.appendChild(empty); return;} networks.forEach(n=>{const btn=document.createElement('button'); btn.type='button'; btn.className='network-item'; btn.addEventListener('click',()=>selectNetwork(n.ssid||'')); const left=document.createElement('span'); left.textContent=(n.ssid&&n.ssid.length)?n.ssid:'(oculta)'; const right=document.createElement('span'); right.className='network-meta'; right.textContent=(n.enc?'Senha':'Aberta')+' | '+n.rssi+' dBm'; btn.appendChild(left); btn.appendChild(right); box.appendChild(btn);});}
-function scanWifi(){const btn=$('btnScanWifi'); if(btn) btn.disabled=true; renderWifiNetworks([]); put('cmScanNote','Varrendo redes Wi-Fi...'); fetch('/api/scan').then(r=>r.json()).then(d=>{renderWifiNetworks(d.networks||[]); put('cmScanNote',txt(d.note,d.ok?'Scan concluido':'Falha no scan')); put('cmScanSummary',txt(d.note,d.ok?'Scan concluido':'Falha no scan'));}).catch(()=>{put('cmScanNote','Erro ao executar o scan.'); put('cmScanSummary','Erro ao executar o scan.');}).finally(()=>{if(btn) btn.disabled=false;});}
+function scanWifi(){const btn=$('btnScanWifi'); if(btn) btn.disabled=true; renderWifiNetworks([]); put('cmScanNote','Varrendo redes Wi-Fi...'); fetchJson('/api/scan').then(d=>{renderWifiNetworks(d.networks||[]); put('cmScanNote',txt(d.note,d.ok?'Scan concluido':'Falha no scan')); put('cmScanSummary',txt(d.note,d.ok?'Scan concluido':'Falha no scan'));}).catch(()=>{put('cmScanNote','Erro ao executar o scan.'); put('cmScanSummary','Erro ao executar o scan.');}).finally(()=>{if(btn) btn.disabled=false;});}
 function selectNetwork(ssid){const e=$('cmStaSsid'); if(e){e.value=ssid; e.dataset.user='1';} const p=$('cmStaPass'); if(p) p.focus();}
 function plotSky(sats){const cvs=$('skyplot'); if(!cvs)return; const r=cvs.width=cvs.offsetWidth, h=cvs.height=cvs.offsetHeight, ctx=cvs.getContext('2d'), cx=r/2, cy=h/2, maxR=cx*0.9; ctx.clearRect(0,0,r,h); ctx.strokeStyle='#21445f'; ctx.lineWidth=1; [1,0.66,0.33].forEach(f=>{ctx.beginPath(); ctx.arc(cx,cy,maxR*f,0,2*Math.PI); ctx.stroke();}); for(let i=0;i<12;i++){ctx.beginPath();const a=i*30*Math.PI/180; ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(a)*maxR, cy+Math.sin(a)*maxR); ctx.stroke();} if(!sats||!sats.length)return; sats.forEach(s=>{const el=Math.max(0,Math.min(90,s.e)), az=s.a||0, dist=maxR*(90-el)/90, ang=(az-90)*Math.PI/180, px=cx+Math.cos(ang)*dist, py=cy+Math.sin(ang)*dist; let c='#41d39b'; if(s.t==='R')c='#c872ff'; else if(s.t==='B')c='#ff7a59'; else if(s.t==='E')c='#6fd6ff'; ctx.beginPath(); ctx.arc(px,py,s.s>0?6:4,0,2*Math.PI); ctx.fillStyle=s.s>0?c:'rgba(150,150,150,0.5)'; ctx.fill(); ctx.strokeStyle='#000'; ctx.stroke(); ctx.fillStyle='#fff'; ctx.font='10px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(s.p, px, py-10);});}
 function drawAH(pitch,roll){const cvs=$('ahCanvas'); if(!cvs)return; const w=cvs.width,h=cvs.height,ctx=cvs.getContext('2d'),cx=w/2,cy=h/2; ctx.save(); ctx.clearRect(0,0,w,h); ctx.translate(cx,cy); ctx.rotate(-roll*Math.PI/180); const pitchPx=pitch*2; ctx.fillStyle='#1a6fb5'; ctx.fillRect(-w,-h/2+pitchPx,w*2,h); ctx.fillStyle='#7a4a1e'; ctx.fillRect(-w,pitchPx,w*2,h); ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(-w,pitchPx); ctx.lineTo(w,pitchPx); ctx.stroke(); [30,60].forEach(a=>{ctx.save(); ctx.rotate(a*Math.PI/180); ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,-cy+10); ctx.lineTo(0,-cy+20); ctx.stroke(); ctx.restore(); ctx.save(); ctx.rotate(-a*Math.PI/180); ctx.beginPath(); ctx.moveTo(0,-cy+10); ctx.lineTo(0,-cy+20); ctx.stroke(); ctx.restore();}); ctx.restore(); ctx.strokeStyle='#FFD34D'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(cx-30,cy); ctx.lineTo(cx-10,cy); ctx.lineTo(cx-10,cy+8); ctx.stroke(); ctx.beginPath(); ctx.moveTo(cx+30,cy); ctx.lineTo(cx+10,cy); ctx.lineTo(cx+10,cy+8); ctx.stroke(); ctx.beginPath(); ctx.arc(cx,cy,4,0,2*Math.PI); ctx.fillStyle='#FFD34D'; ctx.fill();}
-function fetchData(){fetch('/api/status').then(r=>r.json()).then(d=>{put('heroAp',yes(d.wifi.ap,'AP ligado','AP desligado')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?'Tentando LAN':'Sem LAN')); put('heroIp','http://'+txt(d.wifi.ip)); put('heroMode',d.runtime_light?'Modo leve':'Modo normal'); put('labBmeState',d.meteo.connected?'Ligado':'Off'); put('labImuPitch',num(d.imu.pitch_deg,' deg')); put('labImuRoll',num(d.imu.roll_deg,' deg')); put('labSdLogger',yes(d.blackbox.logging_enabled,'Gravando','Pausado')); put('labGpsState',d.gps.fix?'Fix OK':(d.gps.receiving?'NMEA RX':'Aguardando')); put('labGpsFix',d.gps.fix?'Valido':'Sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsSentence',txt(d.gps.last_sentence)); put('labLoraState',yes(d.lora.enabled,'UART ativa','UART desligada')); put('lrRx2',txt(d.lora.rx_bytes)); put('lrTx2',txt(d.lora.tx_bytes)); put('lrAux2',d.lora.aux_high?'HIGH':'LOW'); put('lrMsg2',txt(d.lora.last_message)); put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsRate',txt(d.gps.update_hz)+' Hz'); put('gpsLastRx',txt(d.gps.last_rx_ms)+' ms'); put('gpsSentence',txt(d.gps.last_sentence)); put('gpsHistory',txt(d.gps.history).replaceAll('\\n','\n')); linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps'); if(d.sats_arr){plotSky(d.sats_arr); const total=d.sats_arr.length, gpsCount=d.sats_arr.filter(s=>s.t==='G').length, glo=d.sats_arr.filter(s=>s.t==='R').length, bds=d.sats_arr.filter(s=>s.t==='B').length, gal=d.sats_arr.filter(s=>s.t==='E').length; put('skpTotal',total+' sats visiveis'); put('skpGps','GPS '+gpsCount); put('skpGlo','GLO '+glo); put('skpBds','BDS '+bds); put('skpGal','GAL '+gal);} put('sdMounted',yes(d.blackbox.mounted,'montado','sem cartao')); put('sdLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('sdFile',txt(d.blackbox.file_name)); put('sdRecords',txt(d.blackbox.records)); put('sdSize',txt(d.blackbox.card_size_bytes)); put('sdTail',txt(d.blackbox.tail).replaceAll('\\n','\n')); put('sdFiles',txt(d.blackbox.files).replaceAll('\\n','\n')); put('mtTheme',txt(d.meteo.theme)); put('mtSummary',txt(d.meteo.summary)); put('mtTemp',num(d.meteo.temperature_c,' C')); put('mtHum',num(d.meteo.humidity_pct,' %')); put('mtPress',num(d.meteo.pressure_hpa,' hPa')); put('mtAlt',num(d.meteo.altitude_m,' m')); put('mtGas',num(d.meteo.gas_ohms,' ohms')); put('lrState',yes(d.lora.enabled,'ATIVO','DESLIGADO')); put('lrUart',yes(d.lora.uart_ready,'OK','OFF')); put('lrAux',d.lora.aux_high?'HIGH':'LOW'); put('lrRxState',d.lora.receiving?'recebendo':'idle'); put('lrLastRx',txt(d.lora.last_rx_message)); put('lrLastTx',txt(d.lora.last_tx_payload)); put('lrRxBytes',txt(d.lora.rx_bytes)); put('lrTxBytes',txt(d.lora.tx_bytes)); put('lrNote',txt(d.lora.note)); put('lrAutoState',d.lora.auto_tx_enabled?'ATIVO':'DESLIGADO'); put('lrAutoMode',txt(d.lora.auto_tx_mode,'summary')); put('lrAutoInterval',num((d.lora.auto_tx_interval_ms||0)/1000,' s')); put('lrAutoLast',num(d.lora.last_auto_tx_ms,' ms')); put('lrConsole',txt(d.lora.history).replaceAll('\\n','\n')); put('cmMode',txt(d.wifi.mode)); put('cmApState',yes(d.wifi.ap,'Ligado','Desligado')); put('cmLanState',d.wifi.sta_connected?'Conectado':(d.wifi.sta_requested?'Tentando':'Desligado')); put('cmStaIp',txt(d.wifi.sta_ip)); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); put('cmWifiNote',txt(d.wifi.note)); put('cmLanNote',txt(d.wifi.sta_note)); put('cmScanNote',txt(d.wifi.scan_summary)); put('cmScanSummary',txt(d.wifi.scan_summary)); val('cmStaSsid',txt(d.wifi.sta_ssid,'')); put('cfScreen',txt(d.screen_label)); put('cfMode',d.runtime_light?'leve':'normal'); put('cfOrientation',txt(d.ui.orientation)); put('cfRotation',txt(d.ui.rotation)); put('cfWifi',d.wifi.ap?('AP '+txt(d.wifi.mode)):txt(d.wifi.mode)); put('cfLora',yes(d.lora.enabled,'Ligado','Desligado')); put('cfLogger',yes(d.blackbox.logging_enabled,'Ligado','Pausado')); put('cfFile',txt(d.blackbox.file)); put('cfRecords',txt(d.blackbox.records)); put('cfNote',txt(d.blackbox.note)); put('cfSensors',txt(d.sensors.known)); put('cfScan',txt(d.sensors.scan)); put('ovUptime',num(d.uptime_s,' s')); put('ovScreen',txt(d.screen_label)); put('ovRuntime',d.runtime_light?'Modo leve':'Modo normal'); put('ovIp','http://'+txt(d.wifi.ip)); put('ovNetMode',txt(d.wifi.mode)); put('ovAp',yes(d.wifi.ap,'Ligado','Desligado')); put('ovLan',d.wifi.sta_connected?txt(d.wifi.sta_ip):txt(d.wifi.sta_note)); put('ovClients',txt(d.wifi.clients)); put('ovHits',txt(d.wifi.web_hits)); put('ovGps',d.gps.fix?'Fix OK':(d.gps.receiving?'NMEA RX':'Sem GPS')); put('ovSats',txt(d.gps.sats)); put('ovTemp',num(d.meteo.temperature_c,' C')); put('ovHum',num(d.meteo.humidity_pct,' %')); put('ovPress',num(d.meteo.pressure_hpa,' hPa')); put('ovLora',yes(d.lora.enabled,'Ligado','Desligado')); put('ovLoraFlow',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes)+' bytes'); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records)); put('ovActivity',txt(d.activity.recent).replaceAll('\\n','\n')); if(d.plane){put('pltAlt',num(d.plane.avg_altitude_m,' m')); put('pltVs',num(d.plane.avg_vs_ms,' m/s')); put('pltSpd',num(d.plane.avg_speed_kmh,' km/h'));} if(d.imu){const p=d.imu.pitch_deg||0, r=d.imu.roll_deg||0; put('ahPitch',num(p,' deg')); put('ahRoll',num(r,' deg')); drawAH(p,r);}}).catch(()=>{put('heroLan','Sem resposta do servidor'); put('cmScanNote','Falha ao atualizar o painel web.'); put('ovActivity','Sem resposta do servidor web neste momento.');});}
+function applyData(d,includeHeavy){
+  put('heroAp',yes(d.wifi.ap,'AP ligado','AP desligado')); put('heroLan',d.wifi.sta_connected?('LAN OK @ '+txt(d.wifi.sta_ip)):(d.wifi.sta_requested?'Tentando LAN':'Sem LAN')); put('heroIp','http://'+txt(d.wifi.ip)); put('heroMode',d.runtime_light?'Modo leve':'Modo normal');
+  put('labBmeState',d.meteo.connected?'Ligado':'Off'); put('labImuPitch',num(d.imu.pitch_deg,' deg')); put('labImuRoll',num(d.imu.roll_deg,' deg')); put('labSdLogger',yes(d.blackbox.logging_enabled,'Gravando','Pausado'));
+  put('labGpsState',d.gps.fix?'Fix OK':(d.gps.receiving?'NMEA RX':'Aguardando')); put('labGpsFix',d.gps.fix?'Valido':'Sem fix'); put('labGpsSats',txt(d.gps.sats)); put('labGpsPos',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('labGpsSentence',txt(d.gps.last_sentence));
+  put('labLoraState',yes(d.lora.enabled,'UART ativa','UART desligada')); put('lrRx2',txt(d.lora.rx_bytes)); put('lrTx2',txt(d.lora.tx_bytes)); put('lrAux2',d.lora.aux_high?'HIGH':'LOW'); put('lrMsg2',txt(d.lora.last_message));
+  put('gpsSpeed',num(d.gps.speed_kmh,' km/h')); put('gpsLatLon',d.gps.has_location?(num(d.gps.lat,'')+', '+num(d.gps.lon,'')):'--'); put('gpsAlt',num(d.gps.alt_m,' m')); put('gpsRate',txt(d.gps.update_hz)+' Hz'); put('gpsLastRx',txt(d.gps.last_rx_ms)+' ms'); put('gpsSentence',txt(d.gps.last_sentence));
+  linkify('gpsOsmLink',txt(d.gps.map_osm,''),'OpenStreetMap'); linkify('gpsGoogleLink',txt(d.gps.map_google,''),'Google Maps');
+  if(d.sats_arr){plotSky(d.sats_arr); const total=d.sats_arr.length, gpsCount=d.sats_arr.filter(s=>s.t==='G').length, glo=d.sats_arr.filter(s=>s.t==='R').length, bds=d.sats_arr.filter(s=>s.t==='B').length, gal=d.sats_arr.filter(s=>s.t==='E').length; put('skpTotal',total+' sats visiveis'); put('skpGps','GPS '+gpsCount); put('skpGlo','GLO '+glo); put('skpBds','BDS '+bds); put('skpGal','GAL '+gal);}
+  put('sdMounted',yes(d.blackbox.mounted,'montado','sem cartao')); put('sdLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('sdFile',txt(d.blackbox.file_name)); put('sdRecords',txt(d.blackbox.records)); put('sdSize',txt(d.blackbox.card_size_bytes));
+  put('mtTheme',txt(d.meteo.theme)); put('mtSummary',txt(d.meteo.summary)); put('mtTemp',num(d.meteo.temperature_c,' C')); put('mtHum',num(d.meteo.humidity_pct,' %')); put('mtPress',num(d.meteo.pressure_hpa,' hPa')); put('mtAlt',num(d.meteo.altitude_m,' m')); put('mtGas',num(d.meteo.gas_ohms,' ohms'));
+  put('lrState',yes(d.lora.enabled,'ATIVO','DESLIGADO')); put('lrUart',yes(d.lora.uart_ready,'OK','OFF')); put('lrAux',d.lora.aux_high?'HIGH':'LOW'); put('lrRxState',d.lora.receiving?'recebendo':'idle'); put('lrLastRx',txt(d.lora.last_rx_message)); put('lrLastTx',txt(d.lora.last_tx_payload)); put('lrRxBytes',txt(d.lora.rx_bytes)); put('lrTxBytes',txt(d.lora.tx_bytes)); put('lrNote',txt(d.lora.note)); put('lrAutoState',d.lora.auto_tx_enabled?'ATIVO':'DESLIGADO'); put('lrAutoMode',txt(d.lora.auto_tx_mode,'summary')); put('lrAutoInterval',num((d.lora.auto_tx_interval_ms||0)/1000,' s')); put('lrAutoLast',num(d.lora.last_auto_tx_ms,' ms'));
+  put('cmMode',txt(d.wifi.mode)); put('cmApState',yes(d.wifi.ap,'Ligado','Desligado')); put('cmLanState',d.wifi.sta_connected?'Conectado':(d.wifi.sta_requested?'Tentando':'Desligado')); put('cmStaIp',txt(d.wifi.sta_ip)); put('cmClients',txt(d.wifi.clients)); put('cmHits',txt(d.wifi.web_hits)); put('cmWifiNote',txt(d.wifi.note)); put('cmLanNote',txt(d.wifi.sta_note)); put('cmScanNote',txt(d.wifi.scan_summary)); put('cmScanSummary',txt(d.wifi.scan_summary)); val('cmStaSsid',txt(d.wifi.sta_ssid,''));
+  put('cfScreen',txt(d.screen_label)); put('cfMode',d.runtime_light?'leve':'normal'); put('cfOrientation',txt(d.ui.orientation)); put('cfRotation',txt(d.ui.rotation)); put('cfWifi',d.wifi.ap?('AP '+txt(d.wifi.mode)):txt(d.wifi.mode)); put('cfLora',yes(d.lora.enabled,'Ligado','Desligado')); put('cfLogger',yes(d.blackbox.logging_enabled,'Ligado','Pausado')); put('cfFile',txt(d.blackbox.file)); put('cfRecords',txt(d.blackbox.records)); put('cfNote',txt(d.blackbox.note)); put('cfSensors',txt(d.sensors.known)); put('cfScan',txt(d.sensors.scan));
+  put('ovUptime',num(d.uptime_s,' s')); put('ovScreen',txt(d.screen_label)); put('ovRuntime',d.runtime_light?'Modo leve':'Modo normal'); put('ovIp','http://'+txt(d.wifi.ip)); put('ovNetMode',txt(d.wifi.mode)); put('ovAp',yes(d.wifi.ap,'Ligado','Desligado')); put('ovLan',d.wifi.sta_connected?txt(d.wifi.sta_ip):txt(d.wifi.sta_note)); put('ovClients',txt(d.wifi.clients)); put('ovHits',txt(d.wifi.web_hits)); put('ovGps',d.gps.fix?'Fix OK':(d.gps.receiving?'NMEA RX':'Sem GPS')); put('ovSats',txt(d.gps.sats)); put('ovTemp',num(d.meteo.temperature_c,' C')); put('ovHum',num(d.meteo.humidity_pct,' %')); put('ovPress',num(d.meteo.pressure_hpa,' hPa')); put('ovLora',yes(d.lora.enabled,'Ligado','Desligado')); put('ovLoraFlow',txt(d.lora.rx_bytes)+' / '+txt(d.lora.tx_bytes)+' bytes'); put('ovSd',yes(d.blackbox.mounted,'montado','sem cartao')); put('ovLogger',yes(d.blackbox.logging_enabled,'ligado','pausado')); put('ovFile',txt(d.blackbox.file_name)); put('ovRecords',txt(d.blackbox.records));
+  if(d.plane){put('pltAlt',num(d.plane.avg_altitude_m,' m')); put('pltVs',num(d.plane.avg_vs_ms,' m/s')); put('pltSpd',num(d.plane.avg_speed_kmh,' km/h'));}
+  if(d.imu){const p=d.imu.pitch_deg||0, r=d.imu.roll_deg||0; put('ahPitch',num(p,' deg')); put('ahRoll',num(r,' deg')); drawAH(p,r);}
+  if(includeHeavy){
+    put('gpsHistory',txt(d.gps.history).replaceAll('\\n','\n'));
+    put('sdTail',txt(d.blackbox.tail).replaceAll('\\n','\n'));
+    put('sdFiles',txt(d.blackbox.files).replaceAll('\\n','\n'));
+    put('lrConsole',txt(d.lora.history).replaceAll('\\n','\n'));
+    put('ovActivity',txt(d.activity.recent).replaceAll('\\n','\n'));
+  }
+}
+function fetchDetails(force){
+  const now=Date.now();
+  if(detailBusy||(!force&&now-lastDetailAt<DETAIL_INTERVAL_MS)) return Promise.resolve();
+  detailBusy=true;
+  return fetchJson('/api/status?detail=1').then(d=>{applyData(d,true); lastDetailAt=Date.now();}).catch(()=>{}).finally(()=>{detailBusy=false;});
+}
+function fetchData(forceDetails){
+  if(statusBusy) return;
+  statusBusy=true;
+  fetchJson('/api/status').then(d=>{applyData(d,false); return fetchDetails(!!forceDetails);}).catch(()=>{put('heroLan','Sem resposta do servidor'); put('cmScanNote','Falha ao atualizar o painel web.');}).finally(()=>{statusBusy=false;});
+}
 window.addEventListener('hashchange',()=>setTab(activeTabFromHash(),false));
-setTab(activeTabFromHash(),false); fetchData(); setInterval(fetchData,1800);
+setTab(activeTabFromHash(),false);
+fetchData(true);
+setInterval(()=>fetchData(false),STATUS_INTERVAL_MS);
 </script></div></body></html>)WEBJS"));
 }
 
@@ -4224,6 +4210,8 @@ static void handleWifiPortal()
   if (!client) {
     return;
   }
+  client.setTimeout(WIFI_CLIENT_TIMEOUT_MS);
+  client.setNoDelay(true);
 
   char request_line[96];
   if (!readHttpRequestLine(client, request_line, sizeof(request_line))) {
@@ -4249,9 +4237,12 @@ static void handleWifiPortal()
 
   if (strncmp(request_path, "/api/action", 11) == 0) {
     handleHttpActionPath(request_path);
-    sendHttpJsonStatus(client);
+    sendHttpJsonStatus(client, false);
   } else if (strncmp(request_path, "/api/status", 11) == 0) {
-    sendHttpJsonStatus(client);
+    char detail_value[8];
+    const bool include_details = httpQueryValue(request_path, "detail", detail_value, sizeof(detail_value))
+                                 && strcmp(detail_value, "1") == 0;
+    sendHttpJsonStatus(client, include_details);
   } else if (strncmp(request_path, "/download/blackbox", 18) == 0) {
     sendHttpActiveLogDownload(client);
   } else if (strncmp(request_path, "/download/lora", 14) == 0) {
